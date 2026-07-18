@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Auto-generated donation QR (regenerated at runtime from donation.py)
+assets/donate_qr.png
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Your own workbooks / downloaded media (avoid committing large files)
+*.xlsx
+*.xlsm
+downloads/

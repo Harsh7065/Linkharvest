@@ -1,0 +1,6 @@
+openpyxl>=3.1
+requests>=2.31
+customtkinter>=5.2
+pillow>=10.0
+qrcode>=7.4
+pyinstaller>=6.0
