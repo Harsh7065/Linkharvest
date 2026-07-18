@@ -13,11 +13,15 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 from downloader import load_sheet, build_download_tasks, run_downloads
 from donation import generate_qr_image
 from updater import check_for_update
 from version import __version__
 import pdf_extractor
+import data_profiler
+from donut_chart import render_donut
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -70,6 +74,7 @@ class App(ctk.CTk):
         nav_items = [
             ("downloader", "🔗  Link Downloader"),
             ("pdf_extractor", "📄  PDF Extractor"),
+            ("data_profiler", "📊  Data Profiler"),
         ]
         for key, label in nav_items:
             btn = ctk.CTkButton(
@@ -112,6 +117,10 @@ class App(ctk.CTk):
         pdf_page = ctk.CTkScrollableFrame(content, corner_radius=0, fg_color="transparent")
         self.pages["pdf_extractor"] = pdf_page
         self._build_pdf_extractor_page(pdf_page)
+
+        profiler_page = ctk.CTkScrollableFrame(content, corner_radius=0, fg_color="transparent")
+        self.pages["data_profiler"] = profiler_page
+        self._build_data_profiler_page(profiler_page)
 
     # ================================================================
     # PAGE 1: Link Downloader  (unchanged behavior from the original app)
@@ -579,6 +588,361 @@ class App(ctk.CTk):
             except queue.Empty:
                 pass
         self.after(150, self._poll_pdf_queue)
+
+
+    # ================================================================
+    # PAGE 3: Data Profiler  (3-step flow: Ingestion -> Audit -> Export)
+    # ================================================================
+    PROFILER_STAGES = [
+        ("upload", "Ingestion Target"),
+        ("audit", "Dashboard Audit"),
+        ("export", "Export Package"),
+    ]
+
+    def _build_data_profiler_page(self, parent):
+        self.profiler_df = None              # working DataFrame at the Audit stage
+        self.profiler_cleaned_df = None       # result after Execute Clean Data Vector
+        self.profiler_before_results = None   # analyze_data() snapshot right after upload
+        self.profiler_after_results = None    # analyze_data() snapshot right after cleaning
+        self.profiler_results = None          # whatever is currently shown in the Audit stage
+        self.profiler_filepath = None
+        self.profiler_filter_vars = {}
+        self.profiler_chart_canvas = None
+        self.profiler_stage = "upload"
+        self.profiler_max_reached = 0  # index into PROFILER_STAGES the user has unlocked
+
+        ctk.CTkLabel(parent, text="📊 Data Profiling & Processing Suite",
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(25, 2), anchor="w", padx=24)
+        ctk.CTkLabel(parent, text="Upload a file, audit and clean it, then export the result",
+                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 15), anchor="w", padx=24)
+
+        wrapper = ctk.CTkFrame(parent, fg_color="transparent")
+        wrapper.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+        wrapper.grid_columnconfigure(1, weight=1)
+        wrapper.grid_rowconfigure(0, weight=1)
+
+        # --- Stage rail (left) ---
+        rail = ctk.CTkFrame(wrapper, corner_radius=12, width=190)
+        rail.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        rail.grid_propagate(False)
+        ctk.CTkLabel(rail, text="SYSTEM STAGE", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray").pack(pady=(16, 10), padx=14, anchor="w")
+        self.profiler_stage_buttons = {}
+        for key, label in self.PROFILER_STAGES:
+            btn = ctk.CTkButton(
+                rail, text=f"⚪  {label}", anchor="w", height=38,
+                fg_color="transparent", hover_color=("gray80", "gray25"),
+                font=ctk.CTkFont(size=13),
+                command=lambda k=key: self._go_to_profiler_stage(k))
+            btn.pack(fill="x", padx=10, pady=3)
+            self.profiler_stage_buttons[key] = btn
+
+        # --- Content area (right): one frame per stage, swapped in/out ---
+        content = ctk.CTkFrame(wrapper, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+
+        self.profiler_stage_frames = {
+            "upload": self._build_profiler_upload_stage(content),
+            "audit": self._build_profiler_audit_stage(content),
+            "export": self._build_profiler_export_stage(content),
+        }
+
+        self._go_to_profiler_stage("upload", force=True)
+
+    # ---------------- Stage navigation ----------------
+
+    def _go_to_profiler_stage(self, key, force=False):
+        stage_index = [k for k, _ in self.PROFILER_STAGES].index(key)
+        if not force and stage_index > self.profiler_max_reached:
+            return  # rail clicks can't skip ahead of what's actually been done
+        self.profiler_stage = key
+        for frame in self.profiler_stage_frames.values():
+            frame.grid_forget()
+        self.profiler_stage_frames[key].grid(row=0, column=0, sticky="nsew")
+        self._refresh_profiler_stage_rail()
+
+    def _refresh_profiler_stage_rail(self):
+        for i, (key, label) in enumerate(self.PROFILER_STAGES):
+            if key == self.profiler_stage:
+                icon = "🟢"
+            elif i < self.profiler_max_reached:
+                icon = "✅"
+            else:
+                icon = "⚪"
+            self.profiler_stage_buttons[key].configure(text=f"{icon}  {label}")
+
+    # ---------------- Stage 1: Ingestion (upload) ----------------
+
+    def _build_profiler_upload_stage(self, parent):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+        card = ctk.CTkFrame(frame, corner_radius=12)
+        card.pack(fill="x", pady=10)
+        ctk.CTkLabel(card, text="Step 1 — Ingestion Target",
+                     font=ctk.CTkFont(weight="bold", size=16)).pack(pady=(16, 4), padx=16, anchor="w")
+        ctk.CTkLabel(card, text="Select the CSV or Excel file you want to profile and clean.",
+                     font=ctk.CTkFont(size=12), text_color="gray").pack(padx=16, anchor="w", pady=(0, 10))
+        self.profiler_upload_entry = self._path_row(card, "Data file", self._browse_profiler_file)
+
+        self.profiler_upload_status = ctk.CTkLabel(
+            frame, text="", font=ctk.CTkFont(size=12), text_color="gray")
+        self.profiler_upload_status.pack(anchor="w", pady=(4, 10))
+
+        self.profiler_continue_to_audit_btn = ctk.CTkButton(
+            frame, text="Continue to Audit  →", height=42, state="disabled",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=lambda: self._go_to_profiler_stage("audit", force=True))
+        self.profiler_continue_to_audit_btn.pack(fill="x", pady=(6, 0))
+
+        return frame
+
+    def _browse_profiler_file(self, entry):
+        path = filedialog.askopenfilename(filetypes=[("Data files", "*.csv *.xlsx *.xls")])
+        if not path:
+            return
+        entry.delete(0, "end")
+        entry.insert(0, path)
+
+        try:
+            df = data_profiler.load_data(path)
+        except ValueError as e:
+            messagebox.showerror("Could not load file", str(e))
+            return
+
+        self.profiler_filepath = path
+        self.profiler_df = df
+        self.profiler_before_results = data_profiler.analyze_data(df)
+        self.profiler_max_reached = max(self.profiler_max_reached, 1)
+
+        self.profiler_upload_status.configure(
+            text=f"Loaded {len(df):,} record(s), {len(df.columns)} column(s).",
+            text_color="#2FD675")
+        self.profiler_continue_to_audit_btn.configure(state="normal")
+
+        self._refresh_profiler_audit_view()
+        self._refresh_profiler_stage_rail()
+
+    # ---------------- Stage 2: Dashboard Audit ----------------
+
+    def _build_profiler_audit_stage(self, parent):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+        kpi_row = ctk.CTkFrame(frame, fg_color="transparent")
+        kpi_row.pack(fill="x", pady=(10, 10))
+        self.profiler_kpi_labels = {}
+        for key, label in [("total_records", "RECORDS"), ("total_columns", "COLUMNS"),
+                            ("total_anomalies", "ANOMALIES"), ("health_pct", "HEALTH")]:
+            card = ctk.CTkFrame(kpi_row, corner_radius=12)
+            card.pack(side="left", expand=True, fill="both", padx=6)
+            value_lbl = ctk.CTkLabel(card, text="--", font=ctk.CTkFont(size=22, weight="bold"))
+            value_lbl.pack(pady=(14, 0))
+            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=11),
+                         text_color="gray").pack(pady=(0, 14))
+            self.profiler_kpi_labels[key] = value_lbl
+
+        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body.pack(fill="both", expand=True, pady=(0, 10))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+
+        filter_frame = ctk.CTkFrame(body, corner_radius=12)
+        filter_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(filter_frame, text="SELECT OPTIMIZATION FILTERS",
+                     font=ctk.CTkFont(weight="bold", size=13)).pack(pady=(14, 8), padx=16, anchor="w")
+        self.profiler_checkbox_container = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        self.profiler_checkbox_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        ctk.CTkLabel(self.profiler_checkbox_container, text="Upload a file in Step 1 first.",
+                     text_color="gray").pack(anchor="w")
+
+        chart_frame = ctk.CTkFrame(body, corner_radius=12)
+        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        ctk.CTkLabel(chart_frame, text="ANOMALIES DISTRIBUTION MAP",
+                     font=ctk.CTkFont(weight="bold", size=13)).pack(pady=(14, 8), padx=16, anchor="w")
+        self.profiler_chart_container = ctk.CTkFrame(chart_frame, fg_color="transparent")
+        self.profiler_chart_container.pack(fill="both", expand=True, padx=8, pady=(0, 16))
+
+        nav_row = ctk.CTkFrame(frame, fg_color="transparent")
+        nav_row.pack(fill="x")
+        ctk.CTkButton(nav_row, text="←  Back to Ingestion", width=160, fg_color="transparent",
+                      border_width=1, text_color=("gray20", "gray80"),
+                      command=lambda: self._go_to_profiler_stage("upload")).pack(side="left")
+        self.profiler_execute_btn = ctk.CTkButton(
+            nav_row, text="✨ Execute Clean Data Vector", height=44,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#2FD675", hover_color="#25B563", text_color="#0A0A0A",
+            command=self._on_profiler_execute_clean)
+        self.profiler_execute_btn.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+        return frame
+
+    def _refresh_profiler_audit_view(self):
+        self.profiler_results = data_profiler.analyze_data(self.profiler_df)
+        self._rebuild_profiler_filters()
+        self._update_profiler_kpis(self.profiler_results)
+        self._redraw_profiler_chart()
+
+    def _rebuild_profiler_filters(self):
+        for child in self.profiler_checkbox_container.winfo_children():
+            child.destroy()
+        self.profiler_filter_vars = {}
+
+        for key, label in data_profiler.ANOMALY_LABELS.items():
+            count = self.profiler_results.get(key, 0)
+            var = ctk.BooleanVar(value=count > 0)
+            self.profiler_filter_vars[key] = var
+            cb = ctk.CTkCheckBox(
+                self.profiler_checkbox_container, text=f"{label} ({count} cases)",
+                variable=var, command=self._redraw_profiler_chart)
+            cb.pack(anchor="w", pady=6)
+            if count == 0:
+                cb.configure(state="disabled")
+
+    def _update_profiler_kpis(self, results):
+        self.profiler_kpi_labels["total_records"].configure(text=f'{results["total_records"]:,}')
+        self.profiler_kpi_labels["total_columns"].configure(text=str(results["total_columns"]))
+        self.profiler_kpi_labels["total_anomalies"].configure(text=str(results["total_anomalies"]))
+        health = results["health_pct"]
+        color = "#2FD675" if health >= 85 else ("#e0a020" if health >= 60 else "#ff5d5d")
+        self.profiler_kpi_labels["health_pct"].configure(text=f"{health}%", text_color=color)
+
+    def _redraw_profiler_chart(self):
+        if self.profiler_chart_canvas is not None:
+            self.profiler_chart_canvas.get_tk_widget().destroy()
+            self.profiler_chart_canvas = None
+
+        active = {k: v.get() for k, v in self.profiler_filter_vars.items()}
+        fig = render_donut(self.profiler_results, active)
+        self.profiler_chart_canvas = FigureCanvasTkAgg(fig, master=self.profiler_chart_container)
+        self.profiler_chart_canvas.draw()
+        self.profiler_chart_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _on_profiler_execute_clean(self):
+        if self.profiler_df is None:
+            messagebox.showwarning("No data loaded", "Select a CSV or Excel file first.")
+            return
+
+        active_filters = {k: v.get() for k, v in self.profiler_filter_vars.items()}
+        if not any(active_filters.values()):
+            messagebox.showinfo("Nothing selected", "Check at least one filter to clean.")
+            return
+
+        cleaned = data_profiler.clean_data(self.profiler_df, active_filters)
+        self.profiler_cleaned_df = cleaned
+        self.profiler_after_results = data_profiler.analyze_data(cleaned)
+        self.profiler_max_reached = max(self.profiler_max_reached, 2)
+
+        self._update_profiler_export_comparison()
+        self.profiler_export_status.configure(text="", text_color="gray")
+        self._go_to_profiler_stage("export", force=True)
+
+    # ---------------- Stage 3: Export Package ----------------
+
+    def _build_profiler_export_stage(self, parent):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+        ctk.CTkLabel(frame, text="Step 3 — Export Package",
+                     font=ctk.CTkFont(weight="bold", size=16)).pack(pady=(10, 4), anchor="w")
+        ctk.CTkLabel(frame, text="Compare before/after results and save your cleaned file.",
+                     font=ctk.CTkFont(size=12), text_color="gray").pack(anchor="w", pady=(0, 14))
+
+        compare_row = ctk.CTkFrame(frame, fg_color="transparent")
+        compare_row.pack(fill="x", pady=(0, 16))
+        self.profiler_compare_labels = {}
+        for key, label in [("total_records", "RECORDS"), ("total_columns", "COLUMNS"),
+                            ("total_anomalies", "ANOMALIES"), ("health_pct", "HEALTH")]:
+            card = ctk.CTkFrame(compare_row, corner_radius=12)
+            card.pack(side="left", expand=True, fill="both", padx=6)
+            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=11),
+                         text_color="gray").pack(pady=(14, 2))
+            value_lbl = ctk.CTkLabel(card, text="-- → --", font=ctk.CTkFont(size=15, weight="bold"))
+            value_lbl.pack(pady=(0, 4))
+            delta_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont(size=11))
+            delta_lbl.pack(pady=(0, 14))
+            self.profiler_compare_labels[key] = (value_lbl, delta_lbl)
+
+        self.profiler_export_status = ctk.CTkLabel(
+            frame, text="", font=ctk.CTkFont(size=12), text_color="gray",
+            wraplength=650, justify="left")
+        self.profiler_export_status.pack(anchor="w", pady=(0, 10))
+
+        nav_row = ctk.CTkFrame(frame, fg_color="transparent")
+        nav_row.pack(fill="x", pady=(6, 0))
+        ctk.CTkButton(nav_row, text="←  Back to Audit", width=140, fg_color="transparent",
+                      border_width=1, text_color=("gray20", "gray80"),
+                      command=lambda: self._go_to_profiler_stage("audit")).pack(side="left")
+        ctk.CTkButton(nav_row, text="Start Over", width=110, fg_color="transparent",
+                      border_width=1, text_color=("gray20", "gray80"),
+                      command=self._reset_profiler_flow).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            nav_row, text="💾  Save Cleaned File", height=44,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#2FD675", hover_color="#25B563", text_color="#0A0A0A",
+            command=self._on_profiler_save_export).pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+        return frame
+
+    def _update_profiler_export_comparison(self):
+        before = self.profiler_before_results
+        after = self.profiler_after_results
+        for key in ("total_records", "total_columns", "total_anomalies", "health_pct"):
+            value_lbl, delta_lbl = self.profiler_compare_labels[key]
+            b, a = before[key], after[key]
+            suffix = "%" if key == "health_pct" else ""
+            value_lbl.configure(text=f"{b:,}{suffix}  →  {a:,}{suffix}")
+
+            diff = a - b
+            if key == "total_anomalies":
+                good = diff <= 0
+            elif key == "health_pct":
+                good = diff >= 0
+            else:
+                good = True  # record/column count changes are neutral, not good/bad
+            if diff == 0:
+                delta_lbl.configure(text="no change", text_color="gray")
+            else:
+                sign = "+" if diff > 0 else ""
+                delta_lbl.configure(text=f"{sign}{diff}{suffix}",
+                                     text_color=("#2FD675" if good else "#ff5d5d"))
+
+    def _on_profiler_save_export(self):
+        if self.profiler_cleaned_df is None:
+            messagebox.showwarning("Nothing to export", "Clean the data in the Audit step first.")
+            return
+
+        default_name = "cleaned_" + os.path.basename(self.profiler_filepath or "export.csv")
+        out_path = filedialog.asksaveasfilename(
+            title="Save cleaned data as", initialfile=default_name,
+            defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx")])
+        if not out_path:
+            return
+
+        try:
+            data_profiler.save_data(self.profiler_cleaned_df, out_path)
+        except ValueError as e:
+            messagebox.showerror("Could not save file", str(e))
+            return
+
+        self.profiler_export_status.configure(
+            text=f"Saved {len(self.profiler_cleaned_df):,} record(s) to:\n{out_path}",
+            text_color="#2FD675")
+
+    def _reset_profiler_flow(self):
+        self.profiler_df = None
+        self.profiler_cleaned_df = None
+        self.profiler_before_results = None
+        self.profiler_after_results = None
+        self.profiler_results = None
+        self.profiler_filepath = None
+        self.profiler_max_reached = 0
+
+        self.profiler_upload_entry.delete(0, "end")
+        self.profiler_upload_status.configure(text="")
+        self.profiler_continue_to_audit_btn.configure(state="disabled")
+        self.profiler_export_status.configure(text="")
+
+        self._go_to_profiler_stage("upload", force=True)
 
 
 if __name__ == "__main__":
