@@ -7,6 +7,8 @@ echo Building LinkHarvest.exe ...
 pyinstaller --noconfirm --onefile --windowed ^
   --icon=assets\icon.ico ^
   --add-data "assets;assets" ^
+  --collect-all pdfplumber ^
+  --collect-all openai ^
   --name LinkHarvest ^
   app.py
 
