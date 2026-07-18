@@ -20,3 +20,6 @@ Thumbs.db
 *.xlsx
 *.xlsm
 downloads/
+ 
+# OpenAI API key - never commit this 
+.env 
