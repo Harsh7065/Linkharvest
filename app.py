@@ -28,8 +28,8 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("LinkHarvest")
-        self.geometry("740x800")
-        self.minsize(700, 740)
+        self.geometry("740x840")  # Slightly taller to cleanly fit the padded layout
+        self.minsize(700, 780)
         try:
             self.iconbitmap(ICON_PATH)
         except Exception:
@@ -44,36 +44,41 @@ class App(ctk.CTk):
     # ---------------- UI ----------------
     def _build_ui(self):
         ctk.CTkLabel(self, text="🔗 LinkHarvest",
-                     font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(20, 2))
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(25, 2))
         ctk.CTkLabel(self, text="Download images / videos / audio from links in your Excel sheet",
-                     font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(0, 10))
+                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 15))
 
         # File section
         file_frame = ctk.CTkFrame(self, corner_radius=12)
-        file_frame.pack(fill="x", padx=20, pady=8)
+        file_frame.pack(fill="x", padx=24, pady=10)
+        
         self.excel_path = self._path_row(file_frame, "Excel file", self._browse_excel)
+        self.excel_path.insert(0, r"C:\Users\Harsh\Documents\links.xlsx") # Clean matching path
+        
         self.sheet_name = self._entry_row(file_frame, "Sheet name", "Sheet4")
+        
         self.folder_path = self._path_row(file_frame, "Save folder", self._browse_folder)
+        self.folder_path.insert(0, r"C:\Users\Harsh\Downloads\HarvestedFiles") # Clean matching folder
 
         # Row / column range section
         range_frame = ctk.CTkFrame(self, corner_radius=12)
-        range_frame.pack(fill="x", padx=20, pady=8)
+        range_frame.pack(fill="x", padx=24, pady=10)
         ctk.CTkLabel(range_frame, text="Rows & Columns to scan",
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=16, pady=(12, 4))
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
 
         row_line = ctk.CTkFrame(range_frame, fg_color="transparent")
-        row_line.pack(fill="x", padx=16, pady=4)
+        row_line.pack(fill="x", padx=16, pady=6)
         ctk.CTkLabel(row_line, text="Rows:  From").pack(side="left")
         self.row_from = ctk.CTkEntry(row_line, width=70, placeholder_text="2")
         self.row_from.pack(side="left", padx=6)
         ctk.CTkLabel(row_line, text="To").pack(side="left")
         self.row_to = ctk.CTkEntry(row_line, width=70, placeholder_text="last")
         self.row_to.pack(side="left", padx=6)
-        ctk.CTkLabel(row_line, text="(leave 'To' empty for the last row; use the same value in both for one row)",
-                     font=ctk.CTkFont(size=10), text_color="gray").pack(side="left", padx=6)
+        ctk.CTkLabel(row_line, text="(leave 'To' empty for the last row)",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(side="left", padx=6)
 
         col_line = ctk.CTkFrame(range_frame, fg_color="transparent")
-        col_line.pack(fill="x", padx=16, pady=(4, 12))
+        col_line.pack(fill="x", padx=16, pady=(6, 14))
         ctk.CTkLabel(col_line, text="Columns:  From").pack(side="left")
         self.col_from = ctk.CTkEntry(col_line, width=70, placeholder_text="1")
         self.col_from.pack(side="left", padx=6)
@@ -81,16 +86,16 @@ class App(ctk.CTk):
         self.col_to = ctk.CTkEntry(col_line, width=70, placeholder_text="last")
         self.col_to.pack(side="left", padx=6)
         ctk.CTkLabel(col_line, text="(e.g. From=5 To=5 scans only column E)",
-                     font=ctk.CTkFont(size=10), text_color="gray").pack(side="left", padx=6)
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(side="left", padx=6)
 
         # Advanced section
         adv_frame = ctk.CTkFrame(self, corner_radius=12)
-        adv_frame.pack(fill="x", padx=20, pady=8)
+        adv_frame.pack(fill="x", padx=24, pady=10)
         ctk.CTkLabel(adv_frame, text="Advanced (optional)",
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=16, pady=(12, 4))
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
 
         adv_line = ctk.CTkFrame(adv_frame, fg_color="transparent")
-        adv_line.pack(fill="x", padx=16, pady=(0, 4))
+        adv_line.pack(fill="x", padx=16, pady=(0, 6))
         ctk.CTkLabel(adv_line, text="Threads").pack(side="left")
         self.threads_entry = ctk.CTkEntry(adv_line, width=60)
         self.threads_entry.insert(0, str(DEFAULT_THREADS))
@@ -102,39 +107,41 @@ class App(ctk.CTk):
 
         self.adv_warning = ctk.CTkLabel(adv_frame, text="", text_color="#e0a020",
                                          font=ctk.CTkFont(size=11), wraplength=650, justify="left")
-        self.adv_warning.pack(anchor="w", padx=16, pady=(2, 10))
+        self.adv_warning.pack(anchor="w", padx=16, pady=(2, 12))
         self.threads_entry.bind("<KeyRelease>", self._check_advanced_changed)
         self.timeout_entry.bind("<KeyRelease>", self._check_advanced_changed)
 
         # Support / donation section
         donate_frame = ctk.CTkFrame(self, corner_radius=12)
-        donate_frame.pack(fill="x", padx=20, pady=8)
+        donate_frame.pack(fill="x", padx=24, pady=10)
         ctk.CTkLabel(donate_frame, text="❤ Support Development (optional)",
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=16, pady=(12, 4))
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 4))
         ctk.CTkLabel(donate_frame, text="If this tool saved you time, you can scan to leave a UPI donation.",
-                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16)
+                     font=ctk.CTkFont(size=11), text_color="gray").pack()
         self.qr_label = ctk.CTkLabel(donate_frame, text="")
-        self.qr_label.pack(pady=10)
+        self.qr_label.pack(pady=12)
         self._load_donation_qr()
 
         # Progress
         self.progress_bar = ctk.CTkProgressBar(self)
         self.progress_bar.set(0)
-        self.progress_bar.pack(fill="x", padx=20, pady=(16, 4))
-        self.progress_label = ctk.CTkLabel(self, text="0%  (0 / 0)")
+        self.progress_bar.pack(fill="x", padx=24, pady=(16, 4))
+        self.progress_label = ctk.CTkLabel(self, text="0%  (0 / 0)", font=ctk.CTkFont(size=12))
         self.progress_label.pack()
 
-        self.log_box = ctk.CTkTextbox(self, height=120)
-        self.log_box.pack(fill="both", expand=True, padx=20, pady=8)
+        # Log box
+        self.log_box = ctk.CTkTextbox(self, height=140, corner_radius=8)
+        self.log_box.pack(fill="both", expand=True, padx=24, pady=10)
 
-        self.start_btn = ctk.CTkButton(self, text="Start Download", height=42,
+        # Action Button
+        self.start_btn = ctk.CTkButton(self, text="Start Download", height=44,
                                         font=ctk.CTkFont(size=15, weight="bold"),
                                         command=self._start_download)
-        self.start_btn.pack(pady=(4, 16))
+        self.start_btn.pack(pady=(8, 20), fill="x", padx=24)
 
     def _path_row(self, parent, label, browse_cmd):
         line = ctk.CTkFrame(parent, fg_color="transparent")
-        line.pack(fill="x", padx=16, pady=(12, 6))
+        line.pack(fill="x", padx=16, pady=(10, 6))
         ctk.CTkLabel(line, text=label, width=90, anchor="w").pack(side="left")
         entry = ctk.CTkEntry(line)
         entry.pack(side="left", fill="x", expand=True, padx=6)
@@ -168,7 +175,7 @@ class App(ctk.CTk):
             if not os.path.exists(qr_path):
                 generate_qr_image(qr_path)
             pil_img = Image.open(qr_path)
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(180, 180))
+            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(150, 150))
             self.qr_label.configure(image=ctk_img)
         except Exception:
             self.qr_label.configure(text="(Donation QR unavailable)")
