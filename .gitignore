@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 venv/
 
+# Secrets — NEVER commit your OpenAI API key
+.env
+
 # PyInstaller build output
 build/
 dist/
@@ -20,6 +23,3 @@ Thumbs.db
 *.xlsx
 *.xlsm
 downloads/
- 
-# OpenAI API key - never commit this 
-.env 

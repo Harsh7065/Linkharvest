@@ -4,13 +4,17 @@ A desktop app that scans an Excel sheet for links (images, videos, or audio)
 and downloads them in parallel, with a modern UI and a live progress bar.
 
 Originally a VBA macro (`Download_All_Row_Images`), rebuilt in Python with:
-- A modern GUI (dark theme, `customtkinter`)
-- Custom row/column ranges — download everything, or just one specific
-  row/column
-- Live progress bar with percentage
-- Adjustable thread count and timeout (with a warning if you move away
-  from the tested defaults)
-- File-picker for the Excel file and the save folder
+- A modern GUI (dark theme, `customtkinter`), organized into two tabs
+- **Link Downloader tab**: scans an Excel sheet for links, downloads
+  images/videos/audio in parallel, custom row/column ranges, live
+  progress bar
+- **PDF Extractor tab**: describe what to extract in plain English
+  (e.g. "invoice number, vendor, total"), point it at a folder of PDFs,
+  and it uses OpenAI to pull that data into an Excel sheet — accurate,
+  never guesses, multithreaded
+- Adjustable thread counts and timeouts, with warnings if you move away
+  from the tested defaults
+- Automatic update checks against GitHub Releases on startup
 
 ---
 
@@ -48,7 +52,46 @@ naming convention. The file extension is guessed from the URL, so
 video/audio links are saved with the right extension (`.mp4`, `.mp3`,
 etc.) instead of always `.jpg`.
 
-## 3. Support / donation
+## 3. Using the PDF Extractor page
+
+Click **📄 PDF Extractor** in the left sidebar. This page pulls
+structured data out of a folder of PDFs using AI, and compiles the
+results into an Excel sheet.
+
+1. **AI Engine** — choose **OpenAI (gpt-4o)** or **Gemini (1.5 Pro)**.
+   Each provider has its own key slot, so switching back and forth
+   doesn't overwrite the other's saved key.
+2. **API Key** — paste the key for whichever engine you selected
+   (OpenAI: platform.openai.com/api-keys · Gemini: aistudio.google.com/apikey)
+   and click **Save**. It's written to a local `.env` file in the app
+   folder and is never sent anywhere except directly to that provider's
+   API — `.env` is git-ignored so it won't accidentally get committed.
+3. **What to extract** — describe the fields in plain English, e.g.
+   `Invoice number, invoice date, vendor name, total amount, payment due date`.
+4. **Source Folder** — the folder containing your `.pdf` files.
+5. **Output Excel / Sheet Name** — where results get written. If the
+   file and sheet already exist, new rows are appended underneath the
+   existing data rather than overwriting it.
+6. **Concurrent Threads** (1–20, default 10) — how many PDFs to process
+   at once. Higher isn't always faster — both providers rate-limit
+   requests, so very high thread counts can trigger more retries.
+7. Click **Start Extraction**. The log shows real-time per-file status,
+   including which fields weren't found in a given document (the model
+   is instructed to never guess — a blank cell means it genuinely
+   wasn't in the PDF).
+8. On completion, a success popup appears and the output folder opens
+   automatically.
+
+**Costs money to run:** each PDF sent to OpenAI or Gemini consumes API
+credits on your own account with that provider (billed by them, not by
+this app). Check your usage dashboard on whichever platform you're using.
+
+**Handles gracefully:** password-protected/encrypted PDFs, corrupted
+files, scanned/image-only PDFs with no extractable text, API timeouts
+(auto-retries with backoff), and invalid API keys (stops immediately
+with a clear message instead of silently failing on every file).
+
+## 4. Support / donation
 
 The app has no paywall or access restrictions — it's free to use.
 There's an optional "Support Development" panel that shows a UPI QR
@@ -64,7 +107,7 @@ feature of UPI itself, not something this (or any) app can hide or
 turn off. This app only controls what's shown inside its own window;
 it can't change what the payer's UPI app displays.
 
-## 4. Distributing to other people (no Python required)
+## 5. Distributing to other people (no Python required)
 
 This is the "deploy it so anyone can use it" part. LinkHarvest ships
 with a GitHub Actions workflow (`.github/workflows/build.yml`) that
@@ -94,24 +137,28 @@ build_exe.bat
 
 This produces `dist\LinkHarvest.exe` with the custom icon baked in.
 
-## 5. Project structure
+## 6. Project structure
 
 ```
 LinkHarvest/
-├── app.py                      # GUI (entry point)
-├── downloader.py                # scanning + downloading logic
+├── app.py                      # GUI (entry point, both tabs)
+├── downloader.py                # link scanning + downloading logic
+├── pdf_extractor.py              # PDF text extraction + OpenAI + Excel compilation
 ├── donation.py                   # generates the optional UPI donation QR
+├── updater.py                     # checks GitHub Releases for newer versions
+├── version.py                      # current app version (bump before each release)
+├── .env                             # your OpenAI API key (created by the app, git-ignored)
 ├── assets/
-│   └── icon.ico                  # app icon
+│   └── icon.ico                      # app icon
 ├── .github/
 │   └── workflows/
-│       └── build.yml              # auto-builds & releases the .exe on tag push
+│       └── build.yml                  # auto-builds & releases the .exe on tag push
 ├── requirements.txt
-├── build_exe.bat                 # builds a Windows .exe locally
+├── build_exe.bat                    # builds a Windows .exe locally
 └── .gitignore
 ```
 
-## 6. Publishing to GitHub
+## 7. Publishing to GitHub
 
 ```cmd
 cd linkharvest

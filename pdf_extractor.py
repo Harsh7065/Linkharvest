@@ -1,223 +1,404 @@
 """
 pdf_extractor.py
-Backend logic for the "PDF Extractor" feature: reads text out of PDFs,
-sends it to OpenAI (gpt-4o) with a user-supplied prompt, and appends
-the structured result as a new row in an Excel sheet.
 
-Kept separate from the UI so it can be tested/reused on its own,
-matching the pattern used by downloader.py.
+Reads a folder of PDFs, sends each one's text plus a natural-language
+instruction to either OpenAI or Google Gemini (user's choice), gets
+back structured JSON, and compiles everything into an Excel sheet.
+
+Design goals (per spec):
+- Accuracy over guessing: the model is instructed to return null/blank
+  for anything not explicitly present, never to infer or approximate.
+- Concurrency via ThreadPoolExecutor (1-20 threads, default 10).
+- Resilient to encrypted/corrupted PDFs, API timeouts, and rate limits.
+- Provider-agnostic: OpenAI and Gemini are both supported behind one
+  interface (run_extraction), selected by the `provider` argument.
 """
 import os
+import json
 import time
-import threading
+import glob
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pdfplumber
-from openpyxl import Workbook, load_workbook
+import pandas as pd
+
+PROVIDER_OPENAI = "openai"
+PROVIDER_GEMINI = "gemini"
 
 try:
-    from openai import OpenAI, AuthenticationError, APIError, APITimeoutError, APIConnectionError
-except ImportError:  # openai package not installed yet — handled gracefully at call time
-    OpenAI = None
-    AuthenticationError = APIError = APITimeoutError = APIConnectionError = Exception
+    from openai import OpenAI
+    from openai import (
+        AuthenticationError as OpenAIAuthenticationError,
+        APITimeoutError as OpenAIAPITimeoutError,
+        RateLimitError as OpenAIRateLimitError,
+        APIError as OpenAIAPIError,
+    )
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    import google.generativeai as genai
+    from google.api_core.exceptions import (
+        GoogleAPIError,
+        Cancelled as GoogleCancelled,
+        InvalidArgument as GoogleInvalidArgument,
+        PermissionDenied as GooglePermissionDenied,
+        ResourceExhausted as GoogleResourceExhausted,
+        DeadlineExceeded as GoogleDeadlineExceeded,
+    )
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    from dotenv import load_dotenv, set_key
+except ImportError:
+    load_dotenv = None
+    set_key = None
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+OPENAI_MODEL_NAME = "gpt-4o"
+# "-latest" lets Google roll this to their current best Pro model without
+# code changes; override here if you want to pin a specific version.
+GEMINI_MODEL_NAME = "gemini-1.5-pro-latest"
+
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 2  # doubles each retry: 2s, 4s, 8s...
+RETRY_BACKOFF_SECONDS = 2  # doubles each retry: 2s, 4s, 8s
+API_TIMEOUT = 60
+# Cap raw text sent per PDF to stay well inside the model's context window
+# on very long documents (roughly ~40k characters ~ 10k tokens).
+MAX_TEXT_CHARS = 40000
+
+ENV_KEY_NAMES = {
+    PROVIDER_OPENAI: "OPENAI_API_KEY",
+    PROVIDER_GEMINI: "GEMINI_API_KEY",
+}
 
 
-# ---------------- API key storage (.env) ----------------
-
-def save_api_key(api_key: str):
-    """Writes/overwrites OPENAI_API_KEY in a local .env file (never committed — see .gitignore)."""
-    lines = []
-    found = False
-    if os.path.exists(ENV_PATH):
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("OPENAI_API_KEY="):
-                    lines.append(f"OPENAI_API_KEY={api_key}\n")
-                    found = True
-                else:
-                    lines.append(line)
-    if not found:
-        lines.append(f"OPENAI_API_KEY={api_key}\n")
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+class AuthError(Exception):
+    """Raised when the selected provider's API key is missing or invalid."""
 
 
-def load_api_key() -> str:
-    """Returns the saved API key, or '' if none is stored yet."""
+def is_provider_available(provider: str) -> bool:
+    return OPENAI_AVAILABLE if provider == PROVIDER_OPENAI else GEMINI_AVAILABLE
+
+
+# --------------------------------------------------------------------------
+# API key handling (.env file) — one slot per provider
+# --------------------------------------------------------------------------
+def load_api_key(provider: str = PROVIDER_OPENAI) -> str:
+    """Reads the given provider's API key from .env (if present) or the environment."""
+    if load_dotenv:
+        load_dotenv(ENV_PATH, override=False)
+    return os.environ.get(ENV_KEY_NAMES[provider], "")
+
+
+def save_api_key(key: str, provider: str = PROVIDER_OPENAI) -> None:
+    """Writes/updates the given provider's API key in the local .env file."""
+    key = (key or "").strip()
+    if not key:
+        raise ValueError("API key is empty.")
+    env_name = ENV_KEY_NAMES[provider]
     if not os.path.exists(ENV_PATH):
-        return ""
-    with open(ENV_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("OPENAI_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    return ""
+        with open(ENV_PATH, "w") as f:
+            f.write("")
+    if set_key:
+        set_key(ENV_PATH, env_name, key)
+    else:
+        # Fallback if python-dotenv isn't installed for some reason.
+        with open(ENV_PATH, "a") as f:
+            f.write(f"\n{env_name}={key}\n")
+    os.environ[env_name] = key
 
 
-# ---------------- PDF text extraction ----------------
-
+# --------------------------------------------------------------------------
+# PDF text extraction
+# --------------------------------------------------------------------------
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
-    Returns all text from a PDF, page by page. Raises ValueError with a
-    clear, human-readable message on failure (encrypted, corrupted, or
-    unreadable file) instead of letting a blank/cryptic exception through.
+    Extracts raw text from every page of a PDF using pdfplumber.
+    Raises a descriptive exception on encrypted/corrupted/unreadable files
+    so the caller can log a clear, per-file error instead of crashing.
     """
     try:
         text_parts = []
         with pdfplumber.open(pdf_path) as pdf:
+            if getattr(pdf, "is_encrypted", False):
+                raise ValueError("PDF is password-protected/encrypted")
             for page in pdf.pages:
                 page_text = page.extract_text() or ""
-                text_parts.append(page_text)
+                if page_text:
+                    text_parts.append(page_text)
         text = "\n".join(text_parts).strip()
         if not text:
-            raise ValueError("No extractable text found (the PDF may be scanned/image-only).")
-        return text
-    except ValueError:
-        raise
+            raise ValueError("No extractable text found (possibly a scanned/image-only PDF)")
+        return text[:MAX_TEXT_CHARS]
     except Exception as e:
-        msg = str(e).strip()
-        if not msg:
-            msg = "the file may be password-protected or corrupted"
-        raise ValueError(f"Could not read PDF: {msg}")
+        reason = str(e).strip() or (
+            "file could not be opened — it may be password-protected/encrypted "
+            "or corrupted"
+        )
+        raise RuntimeError(f"Could not read PDF: {reason}")
 
 
-# ---------------- OpenAI call (with retry/backoff) ----------------
+# --------------------------------------------------------------------------
+# Shared prompt construction (identical instructions regardless of provider,
+# so behavior is consistent no matter which one the user picks)
+# --------------------------------------------------------------------------
+def _build_system_prompt() -> str:
+    return (
+        "You are a precision data extraction analyst. You will be given the raw "
+        "text of a single document and a list of fields the user wants extracted. "
+        "Rules you must follow exactly:\n"
+        "1. Only return information that is explicitly and unambiguously present "
+        "in the provided text.\n"
+        "2. Never guess, infer, approximate, or generate plausible-sounding values.\n"
+        "3. If a requested field cannot be found in the text, its value MUST be "
+        "null (JSON null), never an empty guess or a placeholder like 'N/A'.\n"
+        "4. Return ONLY a single flat JSON object mapping each requested field "
+        "name to its extracted value (string) or null. No nested objects, no "
+        "commentary, no markdown formatting, no extra keys."
+    )
 
-def call_openai(client, prompt: str, pdf_text: str, model: str = "gpt-4o"):
-    """
-    Sends prompt + extracted PDF text to OpenAI. Retries on timeout/
-    connection errors with exponential backoff. Raises AuthenticationError
-    immediately (no point retrying a bad key) and ValueError for other
-    unrecoverable API errors after retries are exhausted.
-    """
+
+def _build_user_prompt(instructions: str, pdf_text: str) -> str:
+    return (
+        f"Fields to extract (as described by the user):\n{instructions}\n\n"
+        f"--- DOCUMENT TEXT START ---\n{pdf_text}\n--- DOCUMENT TEXT END ---\n\n"
+        "Return a single flat JSON object with one key per requested field."
+    )
+
+
+def _parse_json_object(raw_text: str) -> dict:
+    data = json.loads(raw_text)
+    if not isinstance(data, dict):
+        raise ValueError("Model did not return a JSON object")
+    return data
+
+
+# --------------------------------------------------------------------------
+# OpenAI structured extraction
+# --------------------------------------------------------------------------
+def _call_openai_extract(client, instructions: str, pdf_text: str) -> dict:
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.chat.completions.create(
-                model=model,
+                model=OPENAI_MODEL_NAME,
                 messages=[
-                    {"role": "system", "content": "You extract structured information from documents."},
-                    {"role": "user", "content": f"{prompt}\n\n---\nDocument text:\n{pdf_text}"},
+                    {"role": "system", "content": _build_system_prompt()},
+                    {"role": "user", "content": _build_user_prompt(instructions, pdf_text)},
                 ],
+                response_format={"type": "json_object"},
+                temperature=0,
+                timeout=API_TIMEOUT,
             )
-            return response.choices[0].message.content.strip()
-        except AuthenticationError:
-            raise  # bad key — don't waste retries, let caller short-circuit the batch
-        except (APITimeoutError, APIConnectionError) as e:
+            return _parse_json_object(response.choices[0].message.content)
+        except OpenAIAuthenticationError as e:
+            raise AuthError(f"Invalid or missing OpenAI API key: {e}")
+        except (OpenAIAPITimeoutError, OpenAIRateLimitError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
                 continue
-            raise ValueError(f"OpenAI request timed out after {MAX_RETRIES} attempts: {e}")
-        except APIError as e:
-            raise ValueError(f"OpenAI API error: {e}")
-    raise ValueError(f"OpenAI request failed: {last_error}")
+            raise RuntimeError(f"API timed out/rate-limited after {MAX_RETRIES} attempts: {e}")
+        except json.JSONDecodeError as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                continue
+            raise RuntimeError(f"Model returned invalid JSON after {MAX_RETRIES} attempts: {e}")
+        except OpenAIAPIError as e:
+            raise RuntimeError(f"OpenAI API error: {e}")
+    raise RuntimeError(f"Extraction failed: {last_error}")
 
 
-# ---------------- Excel append ----------------
-
-def append_results_to_excel(save_path: str, rows: list, headers: list = None):
+# --------------------------------------------------------------------------
+# Gemini structured extraction
+# --------------------------------------------------------------------------
+def _call_gemini_extract(model, instructions: str, pdf_text: str) -> dict:
     """
-    Appends rows to save_path (creates the file + header row if it
-    doesn't exist yet). Never overwrites existing rows — each run's
-    results stack underneath the previous ones.
-    rows: list of tuples/lists, one per PDF processed.
+    `model` is a genai.GenerativeModel already configured with the system
+    instruction. Gemini's JSON mode is requested via generation_config's
+    response_mime_type, mirroring OpenAI's response_format json_object.
     """
-    headers = headers or ["File Name", "Extracted Result"]
-    if os.path.exists(save_path):
-        wb = load_workbook(save_path)
-        ws = wb.active
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.append(headers)
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = model.generate_content(
+                _build_user_prompt(instructions, pdf_text),
+                generation_config=genai.types.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0,
+                ),
+                request_options={"timeout": API_TIMEOUT},
+            )
+            return _parse_json_object(response.text)
+        except GooglePermissionDenied as e:
+            raise AuthError(f"Invalid or missing Gemini API key: {e}")
+        except GoogleInvalidArgument as e:
+            # Usually a malformed request rather than a bad key, but an
+            # invalid/malformed API key can also surface here depending on
+            # SDK version — treat it as auth if the message hints at a key
+            # problem, otherwise treat as a per-file failure.
+            msg = str(e).lower()
+            if "api key" in msg or "api_key" in msg:
+                raise AuthError(f"Invalid Gemini API key: {e}")
+            raise RuntimeError(f"Gemini rejected the request: {e}")
+        except (GoogleCancelled, GoogleDeadlineExceeded, GoogleResourceExhausted) as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                continue
+            raise RuntimeError(f"Gemini timed out/rate-limited after {MAX_RETRIES} attempts: {e}")
+        except json.JSONDecodeError as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                continue
+            raise RuntimeError(f"Model returned invalid JSON after {MAX_RETRIES} attempts: {e}")
+        except GoogleAPIError as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                continue
+            raise RuntimeError(f"Gemini API error after {MAX_RETRIES} attempts: {e}")
+    raise RuntimeError(f"Extraction failed: {last_error}")
 
-    for row in rows:
-        ws.append(row)
 
-    wb.save(save_path)
+# --------------------------------------------------------------------------
+# Provider dispatch
+# --------------------------------------------------------------------------
+def _make_client(provider: str, api_key: str):
+    """Builds whatever object the per-file worker needs to call the API."""
+    if provider == PROVIDER_OPENAI:
+        return OpenAI(api_key=api_key)
+    elif provider == PROVIDER_GEMINI:
+        genai.configure(api_key=api_key)
+        return genai.GenerativeModel(
+            GEMINI_MODEL_NAME,
+            system_instruction=_build_system_prompt(),
+        )
+    raise ValueError(f"Unknown provider: {provider}")
 
 
-# ---------------- Threaded pipeline ----------------
+def _call_ai_extract(provider: str, client, instructions: str, pdf_text: str) -> dict:
+    if provider == PROVIDER_OPENAI:
+        return _call_openai_extract(client, instructions, pdf_text)
+    elif provider == PROVIDER_GEMINI:
+        return _call_gemini_extract(client, instructions, pdf_text)
+    raise ValueError(f"Unknown provider: {provider}")
 
-def process_pdfs(pdf_paths: list, api_key: str, prompt: str, excel_save_path: str,
-                  progress_cb=None, log_cb=None, model: str = "gpt-4o"):
+
+# --------------------------------------------------------------------------
+# Per-file processing + thread pool orchestration
+# --------------------------------------------------------------------------
+def _process_single_pdf(pdf_path: str, instructions: str, provider: str, client) -> dict:
     """
-    Processes each PDF independently (extract text -> call OpenAI ->
-    collect result). Writes all successful results to excel_save_path
-    in one batch at the end.
-
-    progress_cb(done, total) — called after each PDF finishes (success or fail).
-    log_cb(message) — called for every warning/error.
-
-    Short-circuits the WHOLE batch immediately if the API key is invalid
-    (no point burning through every file with a key that will never work).
-
-    Returns (ok_count, failed_count).
+    Returns a result dict always containing 'Source File' plus whatever
+    fields the model returned (or an '_error' key on failure).
     """
-    progress_cb = progress_cb or (lambda done, total: None)
-    log_cb = log_cb or (lambda msg: None)
+    filename = os.path.basename(pdf_path)
+    try:
+        text = extract_text_from_pdf(pdf_path)
+    except RuntimeError as e:
+        return {"Source File": filename, "_error": str(e)}
 
-    if not api_key or not api_key.strip():
-        log_cb("No OpenAI API key set. Please enter your key first.")
-        return 0, len(pdf_paths)
+    try:
+        data = _call_ai_extract(provider, client, instructions, text)
+    except AuthError:
+        raise  # bubble up immediately, stop the whole run
+    except RuntimeError as e:
+        return {"Source File": filename, "_error": str(e)}
 
-    if OpenAI is None:
-        log_cb("The 'openai' package isn't installed. Run: pip install openai")
-        return 0, len(pdf_paths)
+    result = {"Source File": filename}
+    for k, v in data.items():
+        result[k] = v if v not in (None, "null") else ""
+    return result
 
-    client = OpenAI(api_key=api_key)
 
+def run_extraction(pdf_paths, instructions: str, provider: str, api_key: str,
+                    max_workers: int, progress_cb, log_cb):
+    """
+    provider: PROVIDER_OPENAI or PROVIDER_GEMINI.
+    progress_cb(done, total) called after every completed file.
+    log_cb(message) called for start/skip/error/found-partial events.
+    Returns list of result dicts (one per PDF, in completion order).
+    Raises AuthError immediately if the API key is invalid (stops early).
+    """
+    if provider not in (PROVIDER_OPENAI, PROVIDER_GEMINI):
+        raise ValueError(f"Unknown provider: {provider}")
+    if not is_provider_available(provider):
+        pkg = "openai" if provider == PROVIDER_OPENAI else "google-generativeai"
+        raise RuntimeError(f"The '{pkg}' package isn't installed. Run: pip install {pkg}")
+    if not api_key:
+        raise AuthError(f"No {provider.title()} API key configured.")
+
+    client = _make_client(provider, api_key)
+    results = []
     total = len(pdf_paths)
     done = 0
-    ok = 0
-    failed = 0
-    results = []
-    lock = threading.Lock()
-    abort_event = threading.Event()
 
-    def worker(pdf_path):
-        nonlocal done, ok, failed
-        if abort_event.is_set():
-            return
-        file_name = os.path.basename(pdf_path)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {
+            executor.submit(_process_single_pdf, path, instructions, provider, client): path
+            for path in pdf_paths
+        }
+        for future in as_completed(future_to_path):
+            path = future_to_path[future]
+            filename = os.path.basename(path)
+            timestamp = time.strftime("%H:%M:%S")
+            try:
+                result = future.result()
+            except AuthError as e:
+                log_cb(f"{timestamp} - AUTH ERROR: {e} — stopping.")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
+            done += 1
+            if "_error" in result:
+                log_cb(f"{timestamp} - FAILED {filename}: {result['_error']}")
+            else:
+                missing = [k for k, v in result.items()
+                           if k != "Source File" and (v is None or v == "")]
+                if missing:
+                    log_cb(f"{timestamp} - Processed {filename} "
+                           f"(not found: {', '.join(missing)})")
+                else:
+                    log_cb(f"{timestamp} - Processed {filename} — all fields found")
+            results.append(result)
+            progress_cb(done, total)
+
+    return results
+
+
+# --------------------------------------------------------------------------
+# Excel compilation (append to existing sheet if present)
+# --------------------------------------------------------------------------
+def compile_to_excel(results: list, excel_path: str, sheet_name: str):
+    """
+    Writes results to excel_path/sheet_name. If the file+sheet already
+    exist, new rows are appended underneath the existing data instead of
+    overwriting it. Column headers are the union of all keys seen
+    (excluding the internal '_error' marker).
+    """
+    clean_rows = [{k: v for k, v in r.items() if k != "_error"} for r in results]
+    new_df = pd.DataFrame(clean_rows)
+
+    if os.path.exists(excel_path):
         try:
-            text = extract_text_from_pdf(pdf_path)
-            result_text = call_openai(client, prompt, text, model=model)
-            with lock:
-                results.append((file_name, result_text))
-                ok += 1
-        except AuthenticationError:
-            abort_event.set()
-            log_cb("Invalid OpenAI API key — stopping the batch.")
-            with lock:
-                failed += 1
-        except ValueError as e:
-            log_cb(f"{file_name}: {e}")
-            with lock:
-                failed += 1
-        finally:
-            with lock:
-                done += 1
-                progress_cb(done, total)
+            existing_df = pd.read_excel(excel_path, sheet_name=sheet_name, engine="openpyxl")
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        except ValueError:
+            # sheet doesn't exist yet in this workbook
+            combined_df = new_df
+        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a",
+                             if_sheet_exists="replace") as writer:
+            combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="w") as writer:
+            new_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    threads = []
-    for pdf_path in pdf_paths:
-        if abort_event.is_set():
-            break
-        t = threading.Thread(target=worker, args=(pdf_path,), daemon=True)
-        threads.append(t)
-        t.start()
 
-    for t in threads:
-        t.join()
-
-    if results:
-        append_results_to_excel(excel_save_path, results)
-
-    # Anything left un-attempted because of an auth short-circuit counts as failed.
-    failed += (total - done)
-
-    return ok, failed
+def list_pdfs(folder_path: str):
+    return sorted(glob.glob(os.path.join(folder_path, "*.pdf")))

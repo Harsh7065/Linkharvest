@@ -9,6 +9,7 @@ pyinstaller --noconfirm --onefile --windowed ^
   --add-data "assets;assets" ^
   --collect-all pdfplumber ^
   --collect-all openai ^
+  --collect-all google.generativeai ^
   --name LinkHarvest ^
   app.py
 

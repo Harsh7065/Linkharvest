@@ -1,138 +1,179 @@
 """
 app.py
-Modern desktop UI for LinkHarvest (Windows) — sidebar navigation between
-feature pages: Link Downloader and PDF Extractor.
+Modern desktop UI for LinkHarvest (Windows).
+Sidebar navigation + swappable pages, grid-based responsive layout.
 Run with:  python app.py
 """
 import os
 import threading
 import queue
+import subprocess
 import webbrowser
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
 from downloader import load_sheet, build_download_tasks, run_downloads
 from donation import generate_qr_image
 from updater import check_for_update
 from version import __version__
-import pdf_extractor
-import data_profiler
-from donut_chart import render_donut
+import pdf_extractor as pe
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 DEFAULT_THREADS = 10
 DEFAULT_TIMEOUT = 30
+DEFAULT_PDF_THREADS = 10
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ICON_PATH = os.path.join(BASE_DIR, "assets", "icon.ico")
 
-SIDEBAR_WIDTH = 200
+SIDEBAR_WIDTH = 230
+ACCENT = ("#1f6feb", "#3c8cff")
+SIDEBAR_BG = ("gray92", "gray14")
+SIDEBAR_BTN_INACTIVE = "transparent"
+SIDEBAR_BTN_HOVER = ("gray85", "gray22")
+
+# Each entry here is one row in the sidebar. Add a tuple to this list to
+# register a new feature/page without touching the layout code.
+NAV_ITEMS = [
+    ("downloader", "🔗", "Link Downloader"),
+    ("pdf_extractor", "📄", "PDF Extractor"),
+    ("support", "❤", "Support"),
+]
 
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"LinkHarvest v{__version__}")
-        self.geometry("980x840")
-        self.minsize(860, 780)
+        self.geometry("1080x760")
+        self.minsize(880, 640)
         try:
             self.iconbitmap(ICON_PATH)
         except Exception:
             pass
 
+        self.log_queue = queue.Queue()
+        self.download_thread = None
+
+        self.pdf_log_queue = queue.Queue()
+        self.pdf_thread = None
+
+        self.nav_buttons = {}
+        self.pages = {}
+        self.current_page = None
+
+        self._build_layout()
+        self._show_page("downloader")
+
+        self.after(150, self._poll_log_queue)
+        self.after(150, self._poll_pdf_log_queue)
+        threading.Thread(target=self._check_update_background, daemon=True).start()
+
+    # ==================================================================
+    # Top-level responsive layout: sidebar (fixed) + content (expands)
+    # ==================================================================
+    def _build_layout(self):
+        self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.pages = {}
         self._build_sidebar()
-        self._build_content_area()
 
-        self.show_page("downloader")
+        # Content host: every page frame lives here, stacked via grid,
+        # and we raise the active one. This avoids rebuilding widgets
+        # every time the user switches pages.
+        self.content_host = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.content_host.grid(row=0, column=1, sticky="nsew")
+        self.content_host.grid_columnconfigure(0, weight=1)
+        self.content_host.grid_rowconfigure(0, weight=1)
 
-        self.after(150, self._poll_downloader_queue)
-        self.after(150, self._poll_pdf_queue)
-        threading.Thread(target=self._check_update_background, daemon=True).start()
+        self.pages["downloader"] = self._build_downloader_page(self.content_host)
+        self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
+        self.pages["support"] = self._build_support_page(self.content_host)
 
-    # ---------------- Sidebar ----------------
+        for page in self.pages.values():
+            page.grid(row=0, column=0, sticky="nsew")
+
     def _build_sidebar(self):
-        sidebar = ctk.CTkFrame(self, width=SIDEBAR_WIDTH, corner_radius=0)
+        sidebar = ctk.CTkFrame(self, width=SIDEBAR_WIDTH, corner_radius=0, fg_color=SIDEBAR_BG)
         sidebar.grid(row=0, column=0, sticky="nsw")
         sidebar.grid_propagate(False)
 
-        ctk.CTkLabel(sidebar, text="🔗 LinkHarvest",
-                     font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(24, 4), padx=16)
-        ctk.CTkLabel(sidebar, text=f"v{__version__}", font=ctk.CTkFont(size=11),
-                     text_color="gray").pack(pady=(0, 24))
+        # Branding
+        brand_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand_frame.pack(fill="x", pady=(26, 6), padx=18)
+        ctk.CTkLabel(brand_frame, text="🔗 LinkHarvest",
+                     font=ctk.CTkFont(size=19, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(brand_frame, text=f"v{__version__}",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", pady=(2, 0))
 
-        self.nav_buttons = {}
-        nav_items = [
-            ("downloader", "🔗  Link Downloader"),
-            ("pdf_extractor", "📄  PDF Extractor"),
-            ("data_profiler", "📊  Data Profiler"),
-        ]
-        for key, label in nav_items:
+        ctk.CTkFrame(sidebar, height=1, fg_color=("gray80", "gray25")).pack(fill="x", padx=18, pady=(14, 14))
+
+        ctk.CTkLabel(sidebar, text="FEATURES", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray", anchor="w").pack(fill="x", padx=20, pady=(0, 6))
+
+        # Nav buttons — driven by NAV_ITEMS, so adding a future feature
+        # is just adding one line to that list.
+        for key, icon, label in NAV_ITEMS:
             btn = ctk.CTkButton(
-                sidebar, text=label, anchor="w", height=42, corner_radius=8,
-                fg_color="transparent", hover_color=("gray80", "gray25"),
-                font=ctk.CTkFont(size=14),
-                command=lambda k=key: self.show_page(k))
-            btn.pack(fill="x", padx=12, pady=4)
+                sidebar, text=f"{icon}   {label}", anchor="w", height=42,
+                corner_radius=8, font=ctk.CTkFont(size=14),
+                fg_color=SIDEBAR_BTN_INACTIVE, hover_color=SIDEBAR_BTN_HOVER,
+                text_color=("gray10", "gray90"),
+                command=lambda k=key: self._show_page(k)
+            )
+            btn.pack(fill="x", padx=14, pady=3)
             self.nav_buttons[key] = btn
 
-        # Spacer pushes the footer to the bottom
-        ctk.CTkFrame(sidebar, fg_color="transparent").pack(fill="both", expand=True)
+        # Footer
+        footer = ctk.CTkFrame(sidebar, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", padx=18, pady=18)
+        ctk.CTkLabel(footer, text="More features coming soon", font=ctk.CTkFont(size=10),
+                     text_color="gray", wraplength=SIDEBAR_WIDTH - 40, justify="left").pack(anchor="w")
 
-        ctk.CTkLabel(sidebar, text="More features coming soon",
-                     font=ctk.CTkFont(size=10), text_color="gray",
-                     wraplength=SIDEBAR_WIDTH - 24, justify="center").pack(pady=(0, 20), padx=12)
-
-    def show_page(self, key):
-        for page_key, page in self.pages.items():
-            page.grid_forget()
-        self.pages[key].grid(row=0, column=0, sticky="nsew")
-        for page_key, btn in self.nav_buttons.items():
-            if page_key == key:
-                btn.configure(fg_color=("gray75", "gray30"))
+    def _show_page(self, key):
+        for k, btn in self.nav_buttons.items():
+            if k == key:
+                btn.configure(fg_color=ACCENT, text_color="white")
             else:
-                btn.configure(fg_color="transparent")
+                btn.configure(fg_color=SIDEBAR_BTN_INACTIVE, text_color=("gray10", "gray90"))
+        self.pages[key].tkraise()
+        self.current_page = key
 
-    # ---------------- Content area ----------------
-    def _build_content_area(self):
-        content = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        content.grid(row=0, column=1, sticky="nsew")
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(0, weight=1)
-        self.content_container = content
+    # Small helper so every page gets a consistent scrollable, padded body
+    # (keeps things usable if the window gets short/narrow).
+    def _new_page(self, parent, title, subtitle=None):
+        page = ctk.CTkFrame(parent, corner_radius=0, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
 
-        downloader_page = ctk.CTkScrollableFrame(content, corner_radius=0, fg_color="transparent")
-        self.pages["downloader"] = downloader_page
-        self._build_downloader_page(downloader_page)
+        header = ctk.CTkFrame(page, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 4))
+        ctk.CTkLabel(header, text=title, font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w")
+        if subtitle:
+            ctk.CTkLabel(header, text=subtitle, font=ctk.CTkFont(size=13),
+                         text_color="gray").pack(anchor="w", pady=(2, 0))
 
-        pdf_page = ctk.CTkScrollableFrame(content, corner_radius=0, fg_color="transparent")
-        self.pages["pdf_extractor"] = pdf_page
-        self._build_pdf_extractor_page(pdf_page)
+        body = ctk.CTkScrollableFrame(page, corner_radius=0, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=20, pady=(4, 20))
+        body.grid_columnconfigure(0, weight=1)
+        return page, body
 
-        profiler_page = ctk.CTkScrollableFrame(content, corner_radius=0, fg_color="transparent")
-        self.pages["data_profiler"] = profiler_page
-        self._build_data_profiler_page(profiler_page)
-
-    # ================================================================
-    # PAGE 1: Link Downloader  (unchanged behavior from the original app)
-    # ================================================================
+    # ==================================================================
+    # PAGE: Link Downloader
+    # ==================================================================
     def _build_downloader_page(self, parent):
-        ctk.CTkLabel(parent, text="Link Downloader",
-                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(25, 2), anchor="w", padx=24)
-        ctk.CTkLabel(parent, text="Download images / videos / audio from links in your Excel sheet",
-                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 15), anchor="w", padx=24)
+        page, body = self._new_page(
+            parent, "Link Downloader",
+            "Scan an Excel sheet for links and download images/videos/audio in parallel")
 
-        file_frame = ctk.CTkFrame(parent, corner_radius=12)
-        file_frame.pack(fill="x", padx=24, pady=10)
+        # File section
+        file_frame = ctk.CTkFrame(body, corner_radius=12)
+        file_frame.pack(fill="x", pady=10)
 
         self.excel_path = self._path_row(file_frame, "Excel file", self._browse_excel)
         self.excel_path.insert(0, r"C:\Users\Harsh\Documents\links.xlsx")
@@ -142,8 +183,9 @@ class App(ctk.CTk):
         self.folder_path = self._path_row(file_frame, "Save folder", self._browse_folder)
         self.folder_path.insert(0, r"C:\Users\Harsh\Downloads\HarvestedFiles")
 
-        range_frame = ctk.CTkFrame(parent, corner_radius=12)
-        range_frame.pack(fill="x", padx=24, pady=10)
+        # Row / column range section
+        range_frame = ctk.CTkFrame(body, corner_radius=12)
+        range_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(range_frame, text="Rows & Columns to scan",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
 
@@ -169,8 +211,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(col_line, text="(e.g. From=5 To=5 scans only column E)",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(side="left", padx=6)
 
-        adv_frame = ctk.CTkFrame(parent, corner_radius=12)
-        adv_frame.pack(fill="x", padx=24, pady=10)
+        # Advanced section
+        adv_frame = ctk.CTkFrame(body, corner_radius=12)
+        adv_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(adv_frame, text="Advanced (optional)",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
 
@@ -191,29 +234,24 @@ class App(ctk.CTk):
         self.threads_entry.bind("<KeyRelease>", self._check_advanced_changed)
         self.timeout_entry.bind("<KeyRelease>", self._check_advanced_changed)
 
-        donate_frame = ctk.CTkFrame(parent, corner_radius=12)
-        donate_frame.pack(fill="x", padx=24, pady=10)
-        ctk.CTkLabel(donate_frame, text="❤ Support Development (optional)",
-                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 4))
-        ctk.CTkLabel(donate_frame, text="If this tool saved you time, you can scan to leave a UPI donation.",
-                     font=ctk.CTkFont(size=11), text_color="gray").pack()
-        self.qr_label = ctk.CTkLabel(donate_frame, text="")
-        self.qr_label.pack(pady=12)
-        self._load_donation_qr()
-
-        self.progress_bar = ctk.CTkProgressBar(parent)
+        # Progress
+        self.progress_bar = ctk.CTkProgressBar(body)
         self.progress_bar.set(0)
-        self.progress_bar.pack(fill="x", padx=24, pady=(16, 4))
-        self.progress_label = ctk.CTkLabel(parent, text="0%  (0 / 0)", font=ctk.CTkFont(size=12))
+        self.progress_bar.pack(fill="x", pady=(16, 4))
+        self.progress_label = ctk.CTkLabel(body, text="0%  (0 / 0)", font=ctk.CTkFont(size=12))
         self.progress_label.pack()
 
-        self.log_box = ctk.CTkTextbox(parent, height=140, corner_radius=8)
-        self.log_box.pack(fill="both", expand=True, padx=24, pady=10)
+        # Log box
+        self.log_box = ctk.CTkTextbox(body, height=150, corner_radius=8)
+        self.log_box.pack(fill="both", expand=True, pady=10)
 
-        self.start_btn = ctk.CTkButton(parent, text="Start Download", height=44,
+        # Action Button
+        self.start_btn = ctk.CTkButton(body, text="Start Download", height=44,
                                         font=ctk.CTkFont(size=15, weight="bold"),
                                         command=self._start_download)
-        self.start_btn.pack(pady=(8, 24), fill="x", padx=24)
+        self.start_btn.pack(pady=(8, 12), fill="x")
+
+        return page
 
     def _path_row(self, parent, label, browse_cmd):
         line = ctk.CTkFrame(parent, fg_color="transparent")
@@ -245,17 +283,419 @@ class App(ctk.CTk):
             entry.delete(0, "end")
             entry.insert(0, path)
 
+    def _check_advanced_changed(self, _event=None):
+        changed = (self.threads_entry.get() != str(DEFAULT_THREADS) or
+                   self.timeout_entry.get() != str(DEFAULT_TIMEOUT))
+        if changed:
+            self.adv_warning.configure(
+                text="⚠ Default settings changed — with more threads or a shorter timeout, "
+                     "some links may fail or remain un-downloaded.")
+        else:
+            self.adv_warning.configure(text="")
+
+    def _start_download(self):
+        if self.download_thread and self.download_thread.is_alive():
+            messagebox.showinfo("Busy", "A download is already running.")
+            return
+
+        excel_path = self.excel_path.get().strip()
+        sheet_name = self.sheet_name.get().strip()
+        folder_path = self.folder_path.get().strip()
+
+        if not excel_path or not os.path.isfile(excel_path):
+            messagebox.showerror("Missing info", "Please select a valid Excel file.")
+            return
+        if not sheet_name:
+            messagebox.showerror("Missing info", "Please enter a sheet name.")
+            return
+        if not folder_path:
+            messagebox.showerror("Missing info", "Please select a save folder.")
+            return
+        os.makedirs(folder_path, exist_ok=True)
+
+        try:
+            row_from = int(self.row_from.get() or 2)
+            row_to = int(self.row_to.get()) if self.row_to.get().strip() else None
+            col_from = int(self.col_from.get() or 1)
+            col_to = int(self.col_to.get()) if self.col_to.get().strip() else None
+            threads = int(self.threads_entry.get() or DEFAULT_THREADS)
+            timeout = int(self.timeout_entry.get() or DEFAULT_TIMEOUT)
+        except ValueError:
+            messagebox.showerror("Invalid input", "Rows, columns, threads and timeout must be numbers.")
+            return
+
+        self.start_btn.configure(state="disabled", text="Downloading...")
+        self.progress_bar.set(0)
+        self.progress_label.configure(text="0%  (0 / 0)")
+        self.log_box.delete("1.0", "end")
+
+        self.download_thread = threading.Thread(
+            target=self._run_download_job,
+            args=(excel_path, sheet_name, folder_path, row_from, row_to,
+                  col_from, col_to, threads, timeout),
+            daemon=True)
+        self.download_thread.start()
+
+    def _run_download_job(self, excel_path, sheet_name, folder_path, row_from,
+                           row_to, col_from, col_to, threads, timeout):
+        try:
+            ws = load_sheet(excel_path, sheet_name)
+            tasks = build_download_tasks(ws, row_from, row_to or ws.max_row,
+                                          col_from, col_to or ws.max_column, folder_path)
+        except Exception as e:
+            self.log_queue.put(("error", f"Failed to read workbook: {e}"))
+            self.log_queue.put(("done", None))
+            return
+
+        if not tasks:
+            self.log_queue.put(("error", "No links found in the selected rows/columns."))
+            self.log_queue.put(("done", None))
+            return
+
+        self.log_queue.put(("info", f"Found {len(tasks)} link(s). Downloading with {threads} thread(s)..."))
+
+        def progress_cb(done, total):
+            self.log_queue.put(("progress", (done, total)))
+
+        def log_cb(msg):
+            self.log_queue.put(("warn", msg))
+
+        ok, failed = run_downloads(tasks, threads, timeout, progress_cb, log_cb)
+        summary = f"Done. {ok} succeeded, {failed} failed."
+        if failed:
+            summary += " Some links may remain un-downloaded — see the log above."
+        self.log_queue.put(("info", summary))
+        self.log_queue.put(("done", None))
+
+    def _poll_log_queue(self):
+        try:
+            while True:
+                kind, payload = self.log_queue.get_nowait()
+                if kind == "progress":
+                    done, total = payload
+                    pct = done / total if total else 0
+                    self.progress_bar.set(pct)
+                    self.progress_label.configure(text=f"{int(pct * 100)}%  ({done} / {total})")
+                elif kind in ("info", "warn", "error"):
+                    self.log_box.insert("end", f"{payload}\n")
+                    self.log_box.see("end")
+                elif kind == "done":
+                    self.start_btn.configure(state="normal", text="Start Download")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_log_queue)
+
+    # ==================================================================
+    # PAGE: PDF Intelligent Extractor
+    # ==================================================================
+    def _build_pdf_extractor_page(self, parent):
+        page, body = self._new_page(
+            parent, "PDF Extractor",
+            "Describe what to pull from a folder of PDFs — accurate, multithreaded, your choice of AI engine")
+
+        # --- Configuration: AI provider + API key ---
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12)
+        cfg_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(cfg_frame, text="Configuration",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        provider_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        provider_line.pack(fill="x", padx=16, pady=(0, 10))
+        ctk.CTkLabel(provider_line, text="AI Engine", width=110, anchor="w").pack(side="left")
+        self.provider_selector = ctk.CTkSegmentedButton(
+            provider_line, values=["OpenAI (gpt-4o)", "Gemini (1.5 Pro)"],
+            command=self._on_provider_change)
+        self.provider_selector.set("OpenAI (gpt-4o)")
+        self.provider_selector.pack(side="left", fill="x", expand=True, padx=6)
+        self._pdf_provider = pe.PROVIDER_OPENAI  # internal state, kept in sync with the selector
+
+        key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        key_line.pack(fill="x", padx=16, pady=(0, 6))
+        self.api_key_field_label = ctk.CTkLabel(key_line, text="OpenAI API Key", width=110, anchor="w")
+        self.api_key_field_label.pack(side="left")
+        self.api_key_entry = ctk.CTkEntry(key_line, show="*")
+        self.api_key_entry.pack(side="left", fill="x", expand=True, padx=6)
+        try:
+            existing_key = pe.load_api_key(self._pdf_provider)
+            if existing_key:
+                self.api_key_entry.insert(0, existing_key)
+        except Exception:
+            pass
+        ctk.CTkButton(key_line, text="Save", width=70, command=self._save_api_key).pack(side="left")
+
+        self.api_key_status = ctk.CTkLabel(cfg_frame, text="Key is stored locally in a .env file, never uploaded anywhere.",
+                                            font=ctk.CTkFont(size=11), text_color="gray")
+        self.api_key_status.pack(anchor="w", padx=16, pady=(0, 12))
+
+        self.provider_warning = ctk.CTkLabel(cfg_frame, text="", text_color="#e0a020",
+                                              font=ctk.CTkFont(size=11), wraplength=650, justify="left")
+        self.provider_warning.pack(anchor="w", padx=16, pady=(0, 10))
+        self._refresh_provider_availability_warning()
+
+        # --- Step 1: target + source ---
+        step1_frame = ctk.CTkFrame(body, corner_radius=12)
+        step1_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(step1_frame, text="Step 1: Define Target & Source",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        ctk.CTkLabel(step1_frame, text="What should be extracted? (natural language, one or more fields)",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16)
+        self.pdf_instructions = ctk.CTkTextbox(step1_frame, height=80, corner_radius=8)
+        self.pdf_instructions.pack(fill="x", padx=16, pady=(4, 12))
+        self.pdf_instructions.insert(
+            "1.0", "Invoice number, invoice date, vendor name, total amount, payment due date")
+
+        self.pdf_source_folder = self._path_row(step1_frame, "Source Folder", self._browse_pdf_source)
+
+        # --- Step 2: output ---
+        step2_frame = ctk.CTkFrame(body, corner_radius=12)
+        step2_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(step2_frame, text="Step 2: Output Destination",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        self.pdf_output_excel = self._path_row(step2_frame, "Output Excel", self._browse_pdf_output)
+        self.pdf_sheet_name = self._entry_row(step2_frame, "Sheet Name", "extracted_results")
+
+        # --- Advanced: thread slider ---
+        pdf_adv_frame = ctk.CTkFrame(body, corner_radius=12)
+        pdf_adv_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(pdf_adv_frame, text="Advanced (optional)",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        slider_line = ctk.CTkFrame(pdf_adv_frame, fg_color="transparent")
+        slider_line.pack(fill="x", padx=16, pady=(0, 12))
+        self.pdf_threads_label = ctk.CTkLabel(slider_line, text=f"Concurrent Threads: {DEFAULT_PDF_THREADS}")
+        self.pdf_threads_label.pack(anchor="w")
+        self.pdf_threads_slider = ctk.CTkSlider(slider_line, from_=1, to=20, number_of_steps=19,
+                                                 command=self._on_pdf_threads_change)
+        self.pdf_threads_slider.set(DEFAULT_PDF_THREADS)
+        self.pdf_threads_slider.pack(fill="x", pady=(6, 0))
+
+        # --- Progress + start ---
+        self.pdf_progress_bar = ctk.CTkProgressBar(body)
+        self.pdf_progress_bar.set(0)
+        self.pdf_progress_bar.pack(fill="x", pady=(16, 4))
+        self.pdf_progress_label = ctk.CTkLabel(body, text="0%  (0 / 0)", font=ctk.CTkFont(size=12))
+        self.pdf_progress_label.pack()
+
+        self.pdf_log_box = ctk.CTkTextbox(body, height=150, corner_radius=8)
+        self.pdf_log_box.pack(fill="both", expand=True, pady=10)
+
+        self.pdf_start_btn = ctk.CTkButton(body, text="Start Extraction", height=44,
+                                            font=ctk.CTkFont(size=15, weight="bold"),
+                                            command=self._start_pdf_extraction)
+        self.pdf_start_btn.pack(pady=(8, 12), fill="x")
+
+        return page
+
+    def _browse_pdf_source(self, entry):
+        path = filedialog.askdirectory()
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _browse_pdf_output(self, entry):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            confirmoverwrite=False)  # we append, not overwrite, so don't scare the user
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _on_pdf_threads_change(self, value):
+        self.pdf_threads_label.configure(text=f"Concurrent Threads: {int(value)}")
+
+    def _on_provider_change(self, selection):
+        self._pdf_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
+                               else pe.PROVIDER_GEMINI)
+        label = "OpenAI API Key" if self._pdf_provider == pe.PROVIDER_OPENAI else "Gemini API Key"
+        self.api_key_field_label.configure(text=label)
+
+        # Swap in whichever key is already saved for the newly selected provider.
+        self.api_key_entry.delete(0, "end")
+        try:
+            existing_key = pe.load_api_key(self._pdf_provider)
+            if existing_key:
+                self.api_key_entry.insert(0, existing_key)
+        except Exception:
+            pass
+        self.api_key_status.configure(
+            text="Key is stored locally in a .env file, never uploaded anywhere.",
+            text_color="gray")
+        self._refresh_provider_availability_warning()
+
+    def _refresh_provider_availability_warning(self):
+        if pe.is_provider_available(self._pdf_provider):
+            self.provider_warning.configure(text="")
+            return
+        pkg = "openai" if self._pdf_provider == pe.PROVIDER_OPENAI else "google-generativeai"
+        self.provider_warning.configure(
+            text=f"⚠ The '{pkg}' package isn't installed. Run: pip install {pkg}")
+
+    def _save_api_key(self):
+        key = self.api_key_entry.get().strip()
+        if not key:
+            messagebox.showerror("Missing key", "Please enter an API key first.")
+            return
+        try:
+            pe.save_api_key(key, provider=self._pdf_provider)
+            self.api_key_status.configure(text="✓ Key saved to .env", text_color="#3ca34d")
+        except Exception as e:
+            messagebox.showerror("Couldn't save key", str(e))
+
+    def _start_pdf_extraction(self):
+        if self.pdf_thread and self.pdf_thread.is_alive():
+            messagebox.showinfo("Busy", "An extraction is already running.")
+            return
+
+        provider = self._pdf_provider
+        if not pe.is_provider_available(provider):
+            pkg = "openai" if provider == pe.PROVIDER_OPENAI else "google-generativeai"
+            messagebox.showerror("Missing dependency",
+                                  f"The '{pkg}' package isn't installed.\nRun: pip install {pkg}")
+            return
+
+        api_key = self.api_key_entry.get().strip()
+        instructions = self.pdf_instructions.get("1.0", "end").strip()
+        source_folder = self.pdf_source_folder.get().strip()
+        output_excel = self.pdf_output_excel.get().strip()
+        sheet_name = self.pdf_sheet_name.get().strip()
+        threads = int(self.pdf_threads_slider.get())
+
+        if not api_key:
+            messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
+            return
+        if not instructions:
+            messagebox.showerror("Missing info", "Please describe what to extract.")
+            return
+        if not source_folder or not os.path.isdir(source_folder):
+            messagebox.showerror("Missing info", "Please select a valid source folder.")
+            return
+        if not output_excel:
+            messagebox.showerror("Missing info", "Please choose an output Excel file path.")
+            return
+        if not sheet_name:
+            messagebox.showerror("Missing info", "Please enter a sheet/workbook name.")
+            return
+
+        pdfs = pe.list_pdfs(source_folder)
+        if not pdfs:
+            messagebox.showerror("No PDFs found", "No .pdf files were found in that folder.")
+            return
+
+        self.pdf_start_btn.configure(state="disabled", text="Extracting...")
+        self.pdf_progress_bar.set(0)
+        self.pdf_progress_label.configure(text="0%  (0 / 0)")
+        self.pdf_log_box.delete("1.0", "end")
+
+        self.pdf_thread = threading.Thread(
+            target=self._run_pdf_extraction_job,
+            args=(pdfs, instructions, provider, api_key, threads, output_excel, sheet_name),
+            daemon=True)
+        self.pdf_thread.start()
+
+    def _run_pdf_extraction_job(self, pdfs, instructions, provider, api_key, threads, output_excel, sheet_name):
+        engine_name = "OpenAI" if provider == pe.PROVIDER_OPENAI else "Gemini"
+        self.pdf_log_queue.put(("info", f"Found {len(pdfs)} PDF(s). Extracting with {engine_name} using {threads} thread(s)..."))
+
+        def progress_cb(done, total):
+            self.pdf_log_queue.put(("progress", (done, total)))
+
+        def log_cb(msg):
+            self.pdf_log_queue.put(("warn", msg))
+
+        try:
+            results = pe.run_extraction(pdfs, instructions, provider, api_key, threads, progress_cb, log_cb)
+        except pe.AuthError as e:
+            self.pdf_log_queue.put(("error", f"Authentication failed: {e}"))
+            self.pdf_log_queue.put(("done", None))
+            return
+        except Exception as e:
+            self.pdf_log_queue.put(("error", f"Extraction failed: {e}"))
+            self.pdf_log_queue.put(("done", None))
+            return
+
+        try:
+            pe.compile_to_excel(results, output_excel, sheet_name)
+        except Exception as e:
+            self.pdf_log_queue.put(("error", f"Extraction finished but writing Excel failed: {e}"))
+            self.pdf_log_queue.put(("done", None))
+            return
+
+        ok = sum(1 for r in results if "_error" not in r)
+        failed = len(results) - ok
+        summary = f"Done. {ok} succeeded, {failed} failed. Saved to {output_excel}"
+        self.pdf_log_queue.put(("info", summary))
+        self.pdf_log_queue.put(("success", output_excel))
+        self.pdf_log_queue.put(("done", None))
+
+    def _poll_pdf_log_queue(self):
+        try:
+            while True:
+                kind, payload = self.pdf_log_queue.get_nowait()
+                if kind == "progress":
+                    done, total = payload
+                    pct = done / total if total else 0
+                    self.pdf_progress_bar.set(pct)
+                    self.pdf_progress_label.configure(text=f"{int(pct * 100)}%  ({done} / {total})")
+                elif kind in ("info", "warn", "error"):
+                    self.pdf_log_box.insert("end", f"{payload}\n")
+                    self.pdf_log_box.see("end")
+                elif kind == "success":
+                    self._on_pdf_extraction_success(payload)
+                elif kind == "done":
+                    self.pdf_start_btn.configure(state="normal", text="Start Extraction")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_pdf_log_queue)
+
+    def _on_pdf_extraction_success(self, output_excel_path):
+        messagebox.showinfo("Extraction complete",
+                             f"Extraction finished.\nResults saved to:\n{output_excel_path}")
+        try:
+            folder = os.path.dirname(os.path.abspath(output_excel_path))
+            if os.name == "nt":
+                os.startfile(folder)
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass  # opening the folder is a convenience, never fatal
+
+    # ==================================================================
+    # PAGE: Support / donation
+    # ==================================================================
+    def _build_support_page(self, parent):
+        page, body = self._new_page(
+            parent, "Support Development",
+            "LinkHarvest is free — this is just an optional way to say thanks")
+
+        donate_frame = ctk.CTkFrame(body, corner_radius=12)
+        donate_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(donate_frame, text="❤ Leave a UPI donation",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(16, 4))
+        ctk.CTkLabel(donate_frame, text="If this tool saved you time, you can scan to leave a UPI donation.",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack()
+        self.qr_label = ctk.CTkLabel(donate_frame, text="")
+        self.qr_label.pack(pady=16)
+        self._load_donation_qr()
+
+        return page
+
     def _load_donation_qr(self):
         qr_path = os.path.join(BASE_DIR, "assets", "donate_qr.png")
         try:
             if not os.path.exists(qr_path):
                 generate_qr_image(qr_path)
             pil_img = Image.open(qr_path)
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(150, 150))
+            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(180, 180))
             self.qr_label.configure(image=ctk_img)
         except Exception:
             self.qr_label.configure(text="(Donation QR unavailable)")
 
+    # ==================================================================
+    # Update checker (applies to the whole app, shown once on startup)
+    # ==================================================================
     def _check_update_background(self):
         info = check_for_update(__version__)
         if info:
@@ -299,650 +739,6 @@ class App(ctk.CTk):
                       command=self.destroy).pack(padx=32, fill="x")
 
         dialog.grab_set()
-
-    def _check_advanced_changed(self, _event=None):
-        changed = (self.threads_entry.get() != str(DEFAULT_THREADS) or
-                   self.timeout_entry.get() != str(DEFAULT_TIMEOUT))
-        if changed:
-            self.adv_warning.configure(
-                text="⚠ Default settings changed — with more threads or a shorter timeout, "
-                     "some links may fail or remain un-downloaded.")
-        else:
-            self.adv_warning.configure(text="")
-
-    def _start_download(self):
-        if getattr(self, "download_thread", None) and self.download_thread.is_alive():
-            messagebox.showinfo("Busy", "A download is already running.")
-            return
-
-        excel_path = self.excel_path.get().strip()
-        sheet_name = self.sheet_name.get().strip()
-        folder_path = self.folder_path.get().strip()
-
-        if not excel_path or not os.path.isfile(excel_path):
-            messagebox.showerror("Missing info", "Please select a valid Excel file.")
-            return
-        if not sheet_name:
-            messagebox.showerror("Missing info", "Please enter a sheet name.")
-            return
-        if not folder_path:
-            messagebox.showerror("Missing info", "Please select a save folder.")
-            return
-        os.makedirs(folder_path, exist_ok=True)
-
-        try:
-            row_from = int(self.row_from.get() or 2)
-            row_to = int(self.row_to.get()) if self.row_to.get().strip() else None
-            col_from = int(self.col_from.get() or 1)
-            col_to = int(self.col_to.get()) if self.col_to.get().strip() else None
-            threads = int(self.threads_entry.get() or DEFAULT_THREADS)
-            timeout = int(self.timeout_entry.get() or DEFAULT_TIMEOUT)
-        except ValueError:
-            messagebox.showerror("Invalid input", "Rows, columns, threads and timeout must be numbers.")
-            return
-
-        self.start_btn.configure(state="disabled", text="Downloading...")
-        self.progress_bar.set(0)
-        self.progress_label.configure(text="0%  (0 / 0)")
-        self.log_box.delete("1.0", "end")
-
-        self.downloader_queue = queue.Queue()
-        self.download_thread = threading.Thread(
-            target=self._run_download_job,
-            args=(excel_path, sheet_name, folder_path, row_from, row_to,
-                  col_from, col_to, threads, timeout),
-            daemon=True)
-        self.download_thread.start()
-
-    def _run_download_job(self, excel_path, sheet_name, folder_path, row_from,
-                           row_to, col_from, col_to, threads, timeout):
-        try:
-            ws = load_sheet(excel_path, sheet_name)
-            tasks = build_download_tasks(ws, row_from, row_to or ws.max_row,
-                                          col_from, col_to or ws.max_column, folder_path)
-        except Exception as e:
-            self.downloader_queue.put(("error", f"Failed to read workbook: {e}"))
-            self.downloader_queue.put(("done", None))
-            return
-
-        if not tasks:
-            self.downloader_queue.put(("error", "No links found in the selected rows/columns."))
-            self.downloader_queue.put(("done", None))
-            return
-
-        self.downloader_queue.put(("info", f"Found {len(tasks)} link(s). Downloading with {threads} thread(s)..."))
-
-        def progress_cb(done, total):
-            self.downloader_queue.put(("progress", (done, total)))
-
-        def log_cb(msg):
-            self.downloader_queue.put(("warn", msg))
-
-        ok, failed = run_downloads(tasks, threads, timeout, progress_cb, log_cb)
-        summary = f"Done. {ok} succeeded, {failed} failed."
-        if failed:
-            summary += " Some links may remain un-downloaded — see the log above."
-        self.downloader_queue.put(("info", summary))
-        self.downloader_queue.put(("done", None))
-
-    def _poll_downloader_queue(self):
-        q = getattr(self, "downloader_queue", None)
-        if q is not None:
-            try:
-                while True:
-                    kind, payload = q.get_nowait()
-                    if kind == "progress":
-                        done, total = payload
-                        pct = done / total if total else 0
-                        self.progress_bar.set(pct)
-                        self.progress_label.configure(text=f"{int(pct * 100)}%  ({done} / {total})")
-                    elif kind in ("info", "warn", "error"):
-                        self.log_box.insert("end", f"{payload}\n")
-                        self.log_box.see("end")
-                    elif kind == "done":
-                        self.start_btn.configure(state="normal", text="Start Download")
-            except queue.Empty:
-                pass
-        self.after(150, self._poll_downloader_queue)
-
-    # ================================================================
-    # PAGE 2: PDF Extractor
-    # ================================================================
-    def _build_pdf_extractor_page(self, parent):
-        self.pdf_paths = []
-
-        ctk.CTkLabel(parent, text="PDF Extractor",
-                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(25, 2), anchor="w", padx=24)
-        ctk.CTkLabel(parent, text="Extract structured data from PDFs using AI, saved straight to Excel",
-                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 15), anchor="w", padx=24)
-
-        # API key section
-        key_frame = ctk.CTkFrame(parent, corner_radius=12)
-        key_frame.pack(fill="x", padx=24, pady=10)
-        ctk.CTkLabel(key_frame, text="OpenAI API Key",
-                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), padx=16, anchor="w")
-        key_line = ctk.CTkFrame(key_frame, fg_color="transparent")
-        key_line.pack(fill="x", padx=16, pady=(0, 14))
-        self.api_key_entry = ctk.CTkEntry(key_line, show="•", placeholder_text="sk-...")
-        self.api_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        saved_key = pdf_extractor.load_api_key()
-        if saved_key:
-            self.api_key_entry.insert(0, saved_key)
-        ctk.CTkButton(key_line, text="Save Key", width=90,
-                      command=self._save_pdf_api_key).pack(side="left")
-
-        # PDF file selection
-        files_frame = ctk.CTkFrame(parent, corner_radius=12)
-        files_frame.pack(fill="x", padx=24, pady=10)
-        ctk.CTkLabel(files_frame, text="PDF files",
-                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), padx=16, anchor="w")
-        files_line = ctk.CTkFrame(files_frame, fg_color="transparent")
-        files_line.pack(fill="x", padx=16, pady=(0, 6))
-        ctk.CTkButton(files_line, text="Choose PDFs...", width=140,
-                      command=self._browse_pdfs).pack(side="left")
-        ctk.CTkButton(files_line, text="Clear", width=80, fg_color="transparent",
-                      border_width=1, text_color=("gray20", "gray80"),
-                      command=self._clear_pdfs).pack(side="left", padx=(8, 0))
-        self.pdf_files_label = ctk.CTkLabel(files_frame, text="No files selected.",
-                                             font=ctk.CTkFont(size=12), text_color="gray",
-                                             wraplength=650, justify="left")
-        self.pdf_files_label.pack(anchor="w", padx=16, pady=(4, 14))
-
-        # Prompt
-        prompt_frame = ctk.CTkFrame(parent, corner_radius=12)
-        prompt_frame.pack(fill="x", padx=24, pady=10)
-        ctk.CTkLabel(prompt_frame, text="Extraction prompt",
-                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), padx=16, anchor="w")
-        self.pdf_prompt_box = ctk.CTkTextbox(prompt_frame, height=80, corner_radius=8)
-        self.pdf_prompt_box.pack(fill="x", padx=16, pady=(0, 14))
-        self.pdf_prompt_box.insert("1.0", "Extract the invoice number, date, and total amount.")
-
-        # Save location
-        save_frame = ctk.CTkFrame(parent, corner_radius=12)
-        save_frame.pack(fill="x", padx=24, pady=10)
-        self.pdf_save_path = self._path_row_save(save_frame, "Save results to",
-                                                  self._browse_pdf_excel_save)
-        self.pdf_save_path.insert(0, r"C:\Users\Harsh\Documents\pdf_extraction_results.xlsx")
-
-        # Progress
-        self.pdf_progress_bar = ctk.CTkProgressBar(parent)
-        self.pdf_progress_bar.set(0)
-        self.pdf_progress_bar.pack(fill="x", padx=24, pady=(16, 4))
-        self.pdf_progress_label = ctk.CTkLabel(parent, text="0%  (0 / 0)", font=ctk.CTkFont(size=12))
-        self.pdf_progress_label.pack()
-
-        # Log
-        self.pdf_log_box = ctk.CTkTextbox(parent, height=140, corner_radius=8)
-        self.pdf_log_box.pack(fill="both", expand=True, padx=24, pady=10)
-
-        self.pdf_start_btn = ctk.CTkButton(parent, text="Start Extraction", height=44,
-                                            font=ctk.CTkFont(size=15, weight="bold"),
-                                            command=self._start_pdf_extraction)
-        self.pdf_start_btn.pack(pady=(8, 24), fill="x", padx=24)
-
-    def _path_row_save(self, parent, label, browse_cmd):
-        ctk.CTkLabel(parent, text=label,
-                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), padx=16, anchor="w")
-        line = ctk.CTkFrame(parent, fg_color="transparent")
-        line.pack(fill="x", padx=16, pady=(0, 14))
-        entry = ctk.CTkEntry(line)
-        entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ctk.CTkButton(line, text="Browse", width=80, command=lambda: browse_cmd(entry)).pack(side="left")
-        return entry
-
-    def _save_pdf_api_key(self):
-        key = self.api_key_entry.get().strip()
-        if not key:
-            messagebox.showerror("Missing key", "Please enter an API key first.")
-            return
-        pdf_extractor.save_api_key(key)
-        messagebox.showinfo("Saved", "API key saved.")
-
-    def _browse_pdfs(self):
-        paths = filedialog.askopenfilenames(filetypes=[("PDF files", "*.pdf")])
-        if paths:
-            self.pdf_paths = list(paths)
-            self.pdf_files_label.configure(
-                text=f"{len(self.pdf_paths)} file(s) selected:\n" +
-                     "\n".join(os.path.basename(p) for p in self.pdf_paths[:8]) +
-                     ("\n..." if len(self.pdf_paths) > 8 else ""))
-
-    def _clear_pdfs(self):
-        self.pdf_paths = []
-        self.pdf_files_label.configure(text="No files selected.")
-
-    def _browse_pdf_excel_save(self, entry):
-        path = filedialog.asksaveasfilename(defaultextension=".xlsx",
-                                             filetypes=[("Excel files", "*.xlsx")])
-        if path:
-            entry.delete(0, "end")
-            entry.insert(0, path)
-
-    def _start_pdf_extraction(self):
-        if getattr(self, "pdf_thread", None) and self.pdf_thread.is_alive():
-            messagebox.showinfo("Busy", "An extraction is already running.")
-            return
-
-        api_key = self.api_key_entry.get().strip()
-        prompt = self.pdf_prompt_box.get("1.0", "end").strip()
-        save_path = self.pdf_save_path.get().strip()
-
-        if not api_key:
-            messagebox.showerror("Missing info", "Please enter and save your OpenAI API key.")
-            return
-        if not self.pdf_paths:
-            messagebox.showerror("Missing info", "Please choose at least one PDF file.")
-            return
-        if not prompt:
-            messagebox.showerror("Missing info", "Please enter an extraction prompt.")
-            return
-        if not save_path:
-            messagebox.showerror("Missing info", "Please choose where to save the results.")
-            return
-
-        self.pdf_start_btn.configure(state="disabled", text="Extracting...")
-        self.pdf_progress_bar.set(0)
-        self.pdf_progress_label.configure(text="0%  (0 / 0)")
-        self.pdf_log_box.delete("1.0", "end")
-
-        self.pdf_queue = queue.Queue()
-        self.pdf_thread = threading.Thread(
-            target=self._run_pdf_job,
-            args=(list(self.pdf_paths), api_key, prompt, save_path),
-            daemon=True)
-        self.pdf_thread.start()
-
-    def _run_pdf_job(self, pdf_paths, api_key, prompt, save_path):
-        def progress_cb(done, total):
-            self.pdf_queue.put(("progress", (done, total)))
-
-        def log_cb(msg):
-            self.pdf_queue.put(("warn", msg))
-
-        self.pdf_queue.put(("info", f"Processing {len(pdf_paths)} PDF(s)..."))
-        ok, failed = pdf_extractor.process_pdfs(
-            pdf_paths, api_key, prompt, save_path,
-            progress_cb=progress_cb, log_cb=log_cb)
-        summary = f"Done. {ok} succeeded, {failed} failed."
-        if ok:
-            summary += f" Results saved to {save_path}"
-        self.pdf_queue.put(("info", summary))
-        self.pdf_queue.put(("done", None))
-
-    def _poll_pdf_queue(self):
-        q = getattr(self, "pdf_queue", None)
-        if q is not None:
-            try:
-                while True:
-                    kind, payload = q.get_nowait()
-                    if kind == "progress":
-                        done, total = payload
-                        pct = done / total if total else 0
-                        self.pdf_progress_bar.set(pct)
-                        self.pdf_progress_label.configure(text=f"{int(pct * 100)}%  ({done} / {total})")
-                    elif kind in ("info", "warn", "error"):
-                        self.pdf_log_box.insert("end", f"{payload}\n")
-                        self.pdf_log_box.see("end")
-                    elif kind == "done":
-                        self.pdf_start_btn.configure(state="normal", text="Start Extraction")
-            except queue.Empty:
-                pass
-        self.after(150, self._poll_pdf_queue)
-
-
-    # ================================================================
-    # PAGE 3: Data Profiler  (3-step flow: Ingestion -> Audit -> Export)
-    # ================================================================
-    PROFILER_STAGES = [
-        ("upload", "Ingestion Target"),
-        ("audit", "Dashboard Audit"),
-        ("export", "Export Package"),
-    ]
-
-    def _build_data_profiler_page(self, parent):
-        self.profiler_df = None              # working DataFrame at the Audit stage
-        self.profiler_cleaned_df = None       # result after Execute Clean Data Vector
-        self.profiler_before_results = None   # analyze_data() snapshot right after upload
-        self.profiler_after_results = None    # analyze_data() snapshot right after cleaning
-        self.profiler_results = None          # whatever is currently shown in the Audit stage
-        self.profiler_filepath = None
-        self.profiler_filter_vars = {}
-        self.profiler_chart_canvas = None
-        self.profiler_stage = "upload"
-        self.profiler_max_reached = 0  # index into PROFILER_STAGES the user has unlocked
-
-        ctk.CTkLabel(parent, text="📊 Data Profiling & Processing Suite",
-                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(25, 2), anchor="w", padx=24)
-        ctk.CTkLabel(parent, text="Upload a file, audit and clean it, then export the result",
-                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 15), anchor="w", padx=24)
-
-        wrapper = ctk.CTkFrame(parent, fg_color="transparent")
-        wrapper.pack(fill="both", expand=True, padx=24, pady=(0, 24))
-        wrapper.grid_columnconfigure(1, weight=1)
-        wrapper.grid_rowconfigure(0, weight=1)
-
-        # --- Stage rail (left) ---
-        rail = ctk.CTkFrame(wrapper, corner_radius=12, width=190)
-        rail.grid(row=0, column=0, sticky="ns", padx=(0, 12))
-        rail.grid_propagate(False)
-        ctk.CTkLabel(rail, text="SYSTEM STAGE", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray").pack(pady=(16, 10), padx=14, anchor="w")
-        self.profiler_stage_buttons = {}
-        for key, label in self.PROFILER_STAGES:
-            btn = ctk.CTkButton(
-                rail, text=f"⚪  {label}", anchor="w", height=38,
-                fg_color="transparent", hover_color=("gray80", "gray25"),
-                font=ctk.CTkFont(size=13),
-                command=lambda k=key: self._go_to_profiler_stage(k))
-            btn.pack(fill="x", padx=10, pady=3)
-            self.profiler_stage_buttons[key] = btn
-
-        # --- Content area (right): one frame per stage, swapped in/out ---
-        content = ctk.CTkFrame(wrapper, fg_color="transparent")
-        content.grid(row=0, column=1, sticky="nsew")
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(0, weight=1)
-
-        self.profiler_stage_frames = {
-            "upload": self._build_profiler_upload_stage(content),
-            "audit": self._build_profiler_audit_stage(content),
-            "export": self._build_profiler_export_stage(content),
-        }
-
-        self._go_to_profiler_stage("upload", force=True)
-
-    # ---------------- Stage navigation ----------------
-
-    def _go_to_profiler_stage(self, key, force=False):
-        stage_index = [k for k, _ in self.PROFILER_STAGES].index(key)
-        if not force and stage_index > self.profiler_max_reached:
-            return  # rail clicks can't skip ahead of what's actually been done
-        self.profiler_stage = key
-        for frame in self.profiler_stage_frames.values():
-            frame.grid_forget()
-        self.profiler_stage_frames[key].grid(row=0, column=0, sticky="nsew")
-        self._refresh_profiler_stage_rail()
-
-    def _refresh_profiler_stage_rail(self):
-        for i, (key, label) in enumerate(self.PROFILER_STAGES):
-            if key == self.profiler_stage:
-                icon = "🟢"
-            elif i < self.profiler_max_reached:
-                icon = "✅"
-            else:
-                icon = "⚪"
-            self.profiler_stage_buttons[key].configure(text=f"{icon}  {label}")
-
-    # ---------------- Stage 1: Ingestion (upload) ----------------
-
-    def _build_profiler_upload_stage(self, parent):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-
-        card = ctk.CTkFrame(frame, corner_radius=12)
-        card.pack(fill="x", pady=10)
-        ctk.CTkLabel(card, text="Step 1 — Ingestion Target",
-                     font=ctk.CTkFont(weight="bold", size=16)).pack(pady=(16, 4), padx=16, anchor="w")
-        ctk.CTkLabel(card, text="Select the CSV or Excel file you want to profile and clean.",
-                     font=ctk.CTkFont(size=12), text_color="gray").pack(padx=16, anchor="w", pady=(0, 10))
-        self.profiler_upload_entry = self._path_row(card, "Data file", self._browse_profiler_file)
-
-        self.profiler_upload_status = ctk.CTkLabel(
-            frame, text="", font=ctk.CTkFont(size=12), text_color="gray")
-        self.profiler_upload_status.pack(anchor="w", pady=(4, 10))
-
-        self.profiler_continue_to_audit_btn = ctk.CTkButton(
-            frame, text="Continue to Audit  →", height=42, state="disabled",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            command=lambda: self._go_to_profiler_stage("audit", force=True))
-        self.profiler_continue_to_audit_btn.pack(fill="x", pady=(6, 0))
-
-        return frame
-
-    def _browse_profiler_file(self, entry):
-        path = filedialog.askopenfilename(filetypes=[("Data files", "*.csv *.xlsx *.xls")])
-        if not path:
-            return
-        entry.delete(0, "end")
-        entry.insert(0, path)
-
-        try:
-            df = data_profiler.load_data(path)
-        except ValueError as e:
-            messagebox.showerror("Could not load file", str(e))
-            return
-
-        self.profiler_filepath = path
-        self.profiler_df = df
-        self.profiler_before_results = data_profiler.analyze_data(df)
-        self.profiler_max_reached = max(self.profiler_max_reached, 1)
-
-        self.profiler_upload_status.configure(
-            text=f"Loaded {len(df):,} record(s), {len(df.columns)} column(s).",
-            text_color="#2FD675")
-        self.profiler_continue_to_audit_btn.configure(state="normal")
-
-        self._refresh_profiler_audit_view()
-        self._refresh_profiler_stage_rail()
-
-    # ---------------- Stage 2: Dashboard Audit ----------------
-
-    def _build_profiler_audit_stage(self, parent):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-
-        kpi_row = ctk.CTkFrame(frame, fg_color="transparent")
-        kpi_row.pack(fill="x", pady=(10, 10))
-        self.profiler_kpi_labels = {}
-        for key, label in [("total_records", "RECORDS"), ("total_columns", "COLUMNS"),
-                            ("total_anomalies", "ANOMALIES"), ("health_pct", "HEALTH")]:
-            card = ctk.CTkFrame(kpi_row, corner_radius=12)
-            card.pack(side="left", expand=True, fill="both", padx=6)
-            value_lbl = ctk.CTkLabel(card, text="--", font=ctk.CTkFont(size=22, weight="bold"))
-            value_lbl.pack(pady=(14, 0))
-            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=11),
-                         text_color="gray").pack(pady=(0, 14))
-            self.profiler_kpi_labels[key] = value_lbl
-
-        body = ctk.CTkFrame(frame, fg_color="transparent")
-        body.pack(fill="both", expand=True, pady=(0, 10))
-        body.grid_columnconfigure(0, weight=1)
-        body.grid_columnconfigure(1, weight=1)
-
-        filter_frame = ctk.CTkFrame(body, corner_radius=12)
-        filter_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ctk.CTkLabel(filter_frame, text="SELECT OPTIMIZATION FILTERS",
-                     font=ctk.CTkFont(weight="bold", size=13)).pack(pady=(14, 8), padx=16, anchor="w")
-        self.profiler_checkbox_container = ctk.CTkFrame(filter_frame, fg_color="transparent")
-        self.profiler_checkbox_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        ctk.CTkLabel(self.profiler_checkbox_container, text="Upload a file in Step 1 first.",
-                     text_color="gray").pack(anchor="w")
-
-        chart_frame = ctk.CTkFrame(body, corner_radius=12)
-        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ctk.CTkLabel(chart_frame, text="ANOMALIES DISTRIBUTION MAP",
-                     font=ctk.CTkFont(weight="bold", size=13)).pack(pady=(14, 8), padx=16, anchor="w")
-        self.profiler_chart_container = ctk.CTkFrame(chart_frame, fg_color="transparent")
-        self.profiler_chart_container.pack(fill="both", expand=True, padx=8, pady=(0, 16))
-
-        nav_row = ctk.CTkFrame(frame, fg_color="transparent")
-        nav_row.pack(fill="x")
-        ctk.CTkButton(nav_row, text="←  Back to Ingestion", width=160, fg_color="transparent",
-                      border_width=1, text_color=("gray20", "gray80"),
-                      command=lambda: self._go_to_profiler_stage("upload")).pack(side="left")
-        self.profiler_execute_btn = ctk.CTkButton(
-            nav_row, text="✨ Execute Clean Data Vector", height=44,
-            font=ctk.CTkFont(size=15, weight="bold"),
-            fg_color="#2FD675", hover_color="#25B563", text_color="#0A0A0A",
-            command=self._on_profiler_execute_clean)
-        self.profiler_execute_btn.pack(side="left", fill="x", expand=True, padx=(10, 0))
-
-        return frame
-
-    def _refresh_profiler_audit_view(self):
-        self.profiler_results = data_profiler.analyze_data(self.profiler_df)
-        self._rebuild_profiler_filters()
-        self._update_profiler_kpis(self.profiler_results)
-        self._redraw_profiler_chart()
-
-    def _rebuild_profiler_filters(self):
-        for child in self.profiler_checkbox_container.winfo_children():
-            child.destroy()
-        self.profiler_filter_vars = {}
-
-        for key, label in data_profiler.ANOMALY_LABELS.items():
-            count = self.profiler_results.get(key, 0)
-            var = ctk.BooleanVar(value=count > 0)
-            self.profiler_filter_vars[key] = var
-            cb = ctk.CTkCheckBox(
-                self.profiler_checkbox_container, text=f"{label} ({count} cases)",
-                variable=var, command=self._redraw_profiler_chart)
-            cb.pack(anchor="w", pady=6)
-            if count == 0:
-                cb.configure(state="disabled")
-
-    def _update_profiler_kpis(self, results):
-        self.profiler_kpi_labels["total_records"].configure(text=f'{results["total_records"]:,}')
-        self.profiler_kpi_labels["total_columns"].configure(text=str(results["total_columns"]))
-        self.profiler_kpi_labels["total_anomalies"].configure(text=str(results["total_anomalies"]))
-        health = results["health_pct"]
-        color = "#2FD675" if health >= 85 else ("#e0a020" if health >= 60 else "#ff5d5d")
-        self.profiler_kpi_labels["health_pct"].configure(text=f"{health}%", text_color=color)
-
-    def _redraw_profiler_chart(self):
-        if self.profiler_chart_canvas is not None:
-            self.profiler_chart_canvas.get_tk_widget().destroy()
-            self.profiler_chart_canvas = None
-
-        active = {k: v.get() for k, v in self.profiler_filter_vars.items()}
-        fig = render_donut(self.profiler_results, active)
-        self.profiler_chart_canvas = FigureCanvasTkAgg(fig, master=self.profiler_chart_container)
-        self.profiler_chart_canvas.draw()
-        self.profiler_chart_canvas.get_tk_widget().pack(fill="both", expand=True)
-
-    def _on_profiler_execute_clean(self):
-        if self.profiler_df is None:
-            messagebox.showwarning("No data loaded", "Select a CSV or Excel file first.")
-            return
-
-        active_filters = {k: v.get() for k, v in self.profiler_filter_vars.items()}
-        if not any(active_filters.values()):
-            messagebox.showinfo("Nothing selected", "Check at least one filter to clean.")
-            return
-
-        cleaned = data_profiler.clean_data(self.profiler_df, active_filters)
-        self.profiler_cleaned_df = cleaned
-        self.profiler_after_results = data_profiler.analyze_data(cleaned)
-        self.profiler_max_reached = max(self.profiler_max_reached, 2)
-
-        self._update_profiler_export_comparison()
-        self.profiler_export_status.configure(text="", text_color="gray")
-        self._go_to_profiler_stage("export", force=True)
-
-    # ---------------- Stage 3: Export Package ----------------
-
-    def _build_profiler_export_stage(self, parent):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-
-        ctk.CTkLabel(frame, text="Step 3 — Export Package",
-                     font=ctk.CTkFont(weight="bold", size=16)).pack(pady=(10, 4), anchor="w")
-        ctk.CTkLabel(frame, text="Compare before/after results and save your cleaned file.",
-                     font=ctk.CTkFont(size=12), text_color="gray").pack(anchor="w", pady=(0, 14))
-
-        compare_row = ctk.CTkFrame(frame, fg_color="transparent")
-        compare_row.pack(fill="x", pady=(0, 16))
-        self.profiler_compare_labels = {}
-        for key, label in [("total_records", "RECORDS"), ("total_columns", "COLUMNS"),
-                            ("total_anomalies", "ANOMALIES"), ("health_pct", "HEALTH")]:
-            card = ctk.CTkFrame(compare_row, corner_radius=12)
-            card.pack(side="left", expand=True, fill="both", padx=6)
-            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=11),
-                         text_color="gray").pack(pady=(14, 2))
-            value_lbl = ctk.CTkLabel(card, text="-- → --", font=ctk.CTkFont(size=15, weight="bold"))
-            value_lbl.pack(pady=(0, 4))
-            delta_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont(size=11))
-            delta_lbl.pack(pady=(0, 14))
-            self.profiler_compare_labels[key] = (value_lbl, delta_lbl)
-
-        self.profiler_export_status = ctk.CTkLabel(
-            frame, text="", font=ctk.CTkFont(size=12), text_color="gray",
-            wraplength=650, justify="left")
-        self.profiler_export_status.pack(anchor="w", pady=(0, 10))
-
-        nav_row = ctk.CTkFrame(frame, fg_color="transparent")
-        nav_row.pack(fill="x", pady=(6, 0))
-        ctk.CTkButton(nav_row, text="←  Back to Audit", width=140, fg_color="transparent",
-                      border_width=1, text_color=("gray20", "gray80"),
-                      command=lambda: self._go_to_profiler_stage("audit")).pack(side="left")
-        ctk.CTkButton(nav_row, text="Start Over", width=110, fg_color="transparent",
-                      border_width=1, text_color=("gray20", "gray80"),
-                      command=self._reset_profiler_flow).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(
-            nav_row, text="💾  Save Cleaned File", height=44,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#2FD675", hover_color="#25B563", text_color="#0A0A0A",
-            command=self._on_profiler_save_export).pack(side="left", fill="x", expand=True, padx=(10, 0))
-
-        return frame
-
-    def _update_profiler_export_comparison(self):
-        before = self.profiler_before_results
-        after = self.profiler_after_results
-        for key in ("total_records", "total_columns", "total_anomalies", "health_pct"):
-            value_lbl, delta_lbl = self.profiler_compare_labels[key]
-            b, a = before[key], after[key]
-            suffix = "%" if key == "health_pct" else ""
-            value_lbl.configure(text=f"{b:,}{suffix}  →  {a:,}{suffix}")
-
-            diff = a - b
-            if key == "total_anomalies":
-                good = diff <= 0
-            elif key == "health_pct":
-                good = diff >= 0
-            else:
-                good = True  # record/column count changes are neutral, not good/bad
-            if diff == 0:
-                delta_lbl.configure(text="no change", text_color="gray")
-            else:
-                sign = "+" if diff > 0 else ""
-                delta_lbl.configure(text=f"{sign}{diff}{suffix}",
-                                     text_color=("#2FD675" if good else "#ff5d5d"))
-
-    def _on_profiler_save_export(self):
-        if self.profiler_cleaned_df is None:
-            messagebox.showwarning("Nothing to export", "Clean the data in the Audit step first.")
-            return
-
-        default_name = "cleaned_" + os.path.basename(self.profiler_filepath or "export.csv")
-        out_path = filedialog.asksaveasfilename(
-            title="Save cleaned data as", initialfile=default_name,
-            defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx")])
-        if not out_path:
-            return
-
-        try:
-            data_profiler.save_data(self.profiler_cleaned_df, out_path)
-        except ValueError as e:
-            messagebox.showerror("Could not save file", str(e))
-            return
-
-        self.profiler_export_status.configure(
-            text=f"Saved {len(self.profiler_cleaned_df):,} record(s) to:\n{out_path}",
-            text_color="#2FD675")
-
-    def _reset_profiler_flow(self):
-        self.profiler_df = None
-        self.profiler_cleaned_df = None
-        self.profiler_before_results = None
-        self.profiler_after_results = None
-        self.profiler_results = None
-        self.profiler_filepath = None
-        self.profiler_max_reached = 0
-
-        self.profiler_upload_entry.delete(0, "end")
-        self.profiler_upload_status.configure(text="")
-        self.profiler_continue_to_audit_btn.configure(state="disabled")
-        self.profiler_export_status.configure(text="")
-
-        self._go_to_profiler_stage("upload", force=True)
 
 
 if __name__ == "__main__":
