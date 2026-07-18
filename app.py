@@ -6,6 +6,7 @@ Run with:  python app.py
 import os
 import threading
 import queue
+import webbrowser
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -13,6 +14,8 @@ from PIL import Image
 
 from downloader import load_sheet, build_download_tasks, run_downloads
 from donation import generate_qr_image
+from updater import check_for_update
+from version import __version__
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -27,7 +30,7 @@ ICON_PATH = os.path.join(BASE_DIR, "assets", "icon.ico")
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("LinkHarvest")
+        self.title(f"LinkHarvest v{__version__}")
         self.geometry("740x840")  # Slightly taller to cleanly fit the padded layout
         self.minsize(700, 780)
         try:
@@ -40,6 +43,7 @@ class App(ctk.CTk):
 
         self._build_ui()
         self.after(150, self._poll_log_queue)
+        threading.Thread(target=self._check_update_background, daemon=True).start()
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -51,14 +55,14 @@ class App(ctk.CTk):
         # File section
         file_frame = ctk.CTkFrame(self, corner_radius=12)
         file_frame.pack(fill="x", padx=24, pady=10)
-        
+
         self.excel_path = self._path_row(file_frame, "Excel file", self._browse_excel)
-        self.excel_path.insert(0, r"C:\Users\Harsh\Documents\links.xlsx") # Clean matching path
-        
+        self.excel_path.insert(0, r"C:\Users\Harsh\Documents\links.xlsx")  # Clean matching path
+
         self.sheet_name = self._entry_row(file_frame, "Sheet name", "Sheet4")
-        
+
         self.folder_path = self._path_row(file_frame, "Save folder", self._browse_folder)
-        self.folder_path.insert(0, r"C:\Users\Harsh\Downloads\HarvestedFiles") # Clean matching folder
+        self.folder_path.insert(0, r"C:\Users\Harsh\Downloads\HarvestedFiles")  # Clean matching folder
 
         # Row / column range section
         range_frame = ctk.CTkFrame(self, corner_radius=12)
@@ -179,6 +183,55 @@ class App(ctk.CTk):
             self.qr_label.configure(image=ctk_img)
         except Exception:
             self.qr_label.configure(text="(Donation QR unavailable)")
+
+    def _check_update_background(self):
+        info = check_for_update(__version__)
+        if info:
+            self.after(0, lambda: self._show_update_prompt(info))
+
+    def _show_update_prompt(self, info):
+        target_url = info.get("download_url") or info["url"]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Update Required")
+        dialog.geometry("440x260")
+        dialog.resizable(False, False)
+        try:
+            dialog.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+        # Make it modal: blocks interaction with the main window until resolved.
+        dialog.transient(self)
+        dialog.grab_set()
+        # Closing the dialog's X button quits the whole app instead of silently
+        # letting the user bypass the update.
+        dialog.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        ctk.CTkLabel(dialog, text="🔄 Update Required",
+                     font=ctk.CTkFont(size=19, weight="bold")).pack(pady=(24, 6))
+        ctk.CTkLabel(
+            dialog,
+            text=(f"A newer version ({info['version']}) is available.\n"
+                  f"You're currently on v{__version__}.\n\n"
+                  "Please download and install the update to keep using LinkHarvest."),
+            font=ctk.CTkFont(size=13), justify="center", wraplength=380
+        ).pack(pady=(0, 18))
+
+        def do_download():
+            webbrowser.open(target_url)
+            # After sending them to the download page, close this running copy —
+            # they need to install and launch the new .exe to continue.
+            self.destroy()
+
+        ctk.CTkButton(dialog, text="⬇  Download Update", height=44,
+                      font=ctk.CTkFont(size=14, weight="bold"),
+                      command=do_download).pack(pady=(0, 8), padx=32, fill="x")
+        ctk.CTkButton(dialog, text="Quit", height=32, fg_color="transparent",
+                      border_width=1, text_color=("gray20", "gray80"),
+                      command=self.destroy).pack(padx=32, fill="x")
+
+        dialog.grab_set()  # re-assert focus after widgets are laid out
 
     def _check_advanced_changed(self, _event=None):
         changed = (self.threads_entry.get() != str(DEFAULT_THREADS) or
