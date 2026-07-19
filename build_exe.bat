@@ -10,6 +10,7 @@ pyinstaller --noconfirm --onefile --windowed ^
   --collect-all pdfplumber ^
   --collect-all openai ^
   --collect-all google.generativeai ^
+  --collect-all matplotlib ^
   --name LinkHarvest ^
   app.py
 

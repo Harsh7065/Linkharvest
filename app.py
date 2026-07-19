@@ -19,6 +19,9 @@ from donation import generate_qr_image
 from updater import check_for_update
 from version import __version__
 import pdf_extractor as pe
+import data_profiler as dp
+from donut_chart import render_donut
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -41,6 +44,7 @@ SIDEBAR_BTN_HOVER = ("gray85", "gray22")
 NAV_ITEMS = [
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
+    ("data_profiler", "🧹", "Data Profiler"),
     ("support", "❤", "Support"),
 ]
 
@@ -93,6 +97,7 @@ class App(ctk.CTk):
 
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
+        self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
         self.pages["support"] = self._build_support_page(self.content_host)
 
         for page in self.pages.values():
@@ -702,6 +707,194 @@ class App(ctk.CTk):
                 subprocess.Popen(["xdg-open", folder])
         except Exception:
             pass  # opening the folder is a convenience, never fatal
+
+    # ==================================================================
+    # PAGE: Data Profiler
+    # ==================================================================
+    def _build_data_profiler_page(self, parent):
+        page, body = self._new_page(
+            parent, "Data Profiler",
+            "Load a CSV/Excel file, detect data-quality issues, and export a cleaned version")
+
+        self.profiler_df = None
+        self.profiler_results = None
+        self.profiler_chart_canvas_widget = None
+
+        # --- Load data ---
+        load_frame = ctk.CTkFrame(body, corner_radius=12)
+        load_frame.pack(fill="x", pady=10)
+        self.profiler_input_path = self._path_row(load_frame, "Data file", self._browse_profiler_input)
+
+        analyze_line = ctk.CTkFrame(load_frame, fg_color="transparent")
+        analyze_line.pack(fill="x", padx=16, pady=(0, 14))
+        self.profiler_analyze_btn = ctk.CTkButton(analyze_line, text="Analyze", height=36,
+                                                    command=self._run_profiler_analysis)
+        self.profiler_analyze_btn.pack(side="left")
+        self.profiler_status_label = ctk.CTkLabel(analyze_line, text="Accepts .csv, .xlsx, .xls",
+                                                    font=ctk.CTkFont(size=11), text_color="gray")
+        self.profiler_status_label.pack(side="left", padx=12)
+
+        # --- KPI cards ---
+        kpi_frame = ctk.CTkFrame(body, corner_radius=12)
+        kpi_frame.pack(fill="x", pady=10)
+        kpi_row = ctk.CTkFrame(kpi_frame, fg_color="transparent")
+        kpi_row.pack(fill="x", padx=16, pady=16)
+        self.profiler_kpi_labels = {}
+        for i, (key, label) in enumerate([
+            ("health_pct", "Health Score"),
+            ("total_records", "Total Records"),
+            ("total_columns", "Total Columns"),
+            ("total_anomalies", "Total Anomalies"),
+        ]):
+            kpi_row.grid_columnconfigure(i, weight=1)
+            card = ctk.CTkFrame(kpi_row, corner_radius=10, fg_color=("gray88", "gray20"))
+            card.grid(row=0, column=i, sticky="nsew", padx=6)
+            value_lbl = ctk.CTkLabel(card, text="—", font=ctk.CTkFont(size=24, weight="bold"))
+            value_lbl.pack(pady=(14, 2))
+            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=11), text_color="gray").pack(pady=(0, 14))
+            self.profiler_kpi_labels[key] = value_lbl
+
+        # --- Filters (left) + donut chart (right) ---
+        split_frame = ctk.CTkFrame(body, fg_color="transparent")
+        split_frame.pack(fill="both", expand=True, pady=10)
+        split_frame.grid_columnconfigure(0, weight=1)
+        split_frame.grid_columnconfigure(1, weight=1)
+        split_frame.grid_rowconfigure(0, weight=1)
+
+        filters_frame = ctk.CTkFrame(split_frame, corner_radius=12)
+        filters_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(filters_frame, text="Anomalies to fix", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 8), padx=16, anchor="w")
+
+        self.profiler_filter_vars = {}
+        self.profiler_checkboxes = {}
+        for key, label in dp.ANOMALY_LABELS.items():
+            var = ctk.BooleanVar(value=False)
+            cb = ctk.CTkCheckBox(filters_frame, text=f"{label} (— cases)", variable=var,
+                                  command=self._on_profiler_filter_toggle, state="disabled")
+            cb.pack(anchor="w", padx=16, pady=6)
+            self.profiler_filter_vars[key] = var
+            self.profiler_checkboxes[key] = cb
+
+        ctk.CTkLabel(filters_frame,
+                     text="Note: Mixed Data Types is shown for review but is never "
+                          "auto-fixed — it's ambiguous, so those cells are left as-is.",
+                     font=ctk.CTkFont(size=10), text_color="gray", wraplength=280,
+                     justify="left").pack(anchor="w", padx=16, pady=(8, 16))
+
+        chart_frame = ctk.CTkFrame(split_frame, corner_radius=12)
+        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        ctk.CTkLabel(chart_frame, text="Anomaly Breakdown", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 8))
+        self.profiler_chart_host = ctk.CTkFrame(chart_frame, fg_color="transparent")
+        self.profiler_chart_host.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+        ctk.CTkLabel(self.profiler_chart_host, text="Analyze a file to see the breakdown",
+                     font=ctk.CTkFont(size=12), text_color="gray").pack(expand=True)
+
+        # --- Export ---
+        export_frame = ctk.CTkFrame(body, corner_radius=12)
+        export_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(export_frame, text="Export Cleaned Data", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 6))
+        self.profiler_clean_btn = ctk.CTkButton(export_frame, text="Clean & Export", height=44,
+                                                  font=ctk.CTkFont(size=15, weight="bold"),
+                                                  command=self._run_profiler_clean_export, state="disabled")
+        self.profiler_clean_btn.pack(pady=(0, 16), padx=16, fill="x")
+
+        return page
+
+    def _browse_profiler_input(self, entry):
+        path = filedialog.askopenfilename(filetypes=[("Data files", "*.csv *.xlsx *.xls")])
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _run_profiler_analysis(self):
+        filepath = self.profiler_input_path.get().strip()
+        if not filepath:
+            messagebox.showerror("Missing info", "Please select a CSV or Excel file first.")
+            return
+        try:
+            df = dp.load_data(filepath)
+        except ValueError as e:
+            messagebox.showerror("Couldn't load file", str(e))
+            return
+
+        self.profiler_df = df
+        self.profiler_results = dp.analyze_data(df)
+        r = self.profiler_results
+
+        self.profiler_kpi_labels["health_pct"].configure(text=f"{r['health_pct']}%")
+        self.profiler_kpi_labels["total_records"].configure(text=str(r["total_records"]))
+        self.profiler_kpi_labels["total_columns"].configure(text=str(r["total_columns"]))
+        self.profiler_kpi_labels["total_anomalies"].configure(text=str(r["total_anomalies"]))
+
+        for key, label in dp.ANOMALY_LABELS.items():
+            count = r.get(key, 0)
+            cb = self.profiler_checkboxes[key]
+            cb.configure(text=f"{label} ({count} cases)")
+            if count > 0:
+                cb.configure(state="normal")
+                self.profiler_filter_vars[key].set(True)
+            else:
+                cb.configure(state="disabled")
+                self.profiler_filter_vars[key].set(False)
+
+        self.profiler_status_label.configure(
+            text=f"Loaded {r['total_records']} rows, {r['total_columns']} columns.",
+            text_color="gray")
+        self.profiler_clean_btn.configure(state="normal")
+
+        self._refresh_profiler_chart()
+
+    def _on_profiler_filter_toggle(self):
+        self._refresh_profiler_chart()
+
+    def _refresh_profiler_chart(self):
+        if not self.profiler_results:
+            return
+        for widget in self.profiler_chart_host.winfo_children():
+            widget.destroy()
+        self.profiler_chart_canvas_widget = None
+
+        active_filters = {k: v.get() for k, v in self.profiler_filter_vars.items()}
+        fig = render_donut(self.profiler_results, active_filters)
+        canvas = FigureCanvasTkAgg(fig, master=self.profiler_chart_host)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.profiler_chart_canvas_widget = canvas
+
+    def _run_profiler_clean_export(self):
+        if self.profiler_df is None:
+            messagebox.showerror("Nothing to export", "Please analyze a file first.")
+            return
+
+        filters = {k: v.get() for k, v in self.profiler_filter_vars.items()}
+        cleaned = dp.clean_data(self.profiler_df, filters)
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv")])
+        if not save_path:
+            return
+        try:
+            dp.save_data(cleaned, save_path)
+        except ValueError as e:
+            messagebox.showerror("Couldn't save file", str(e))
+            return
+
+        messagebox.showinfo(
+            "Export complete",
+            f"Cleaned data saved to:\n{save_path}\n\n"
+            f"{len(self.profiler_df)} rows → {len(cleaned)} rows after cleaning.")
+        try:
+            folder = os.path.dirname(os.path.abspath(save_path))
+            if os.name == "nt":
+                os.startfile(folder)
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
 
     # ==================================================================
     # PAGE: Support / donation

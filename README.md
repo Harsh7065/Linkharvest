@@ -4,14 +4,17 @@ A desktop app that scans an Excel sheet for links (images, videos, or audio)
 and downloads them in parallel, with a modern UI and a live progress bar.
 
 Originally a VBA macro (`Download_All_Row_Images`), rebuilt in Python with:
-- A modern GUI (dark theme, `customtkinter`), organized into two tabs
-- **Link Downloader tab**: scans an Excel sheet for links, downloads
+- A modern GUI (dark theme, `customtkinter`) with sidebar navigation
+- **Link Downloader page**: scans an Excel sheet for links, downloads
   images/videos/audio in parallel, custom row/column ranges, live
   progress bar
-- **PDF Extractor tab**: describe what to extract in plain English
+- **PDF Extractor page**: describe what to extract in plain English
   (e.g. "invoice number, vendor, total"), point it at a folder of PDFs,
-  and it uses OpenAI to pull that data into an Excel sheet — accurate,
-  never guesses, multithreaded
+  and it uses OpenAI or Gemini (your choice) to pull that data into an
+  Excel sheet — accurate, never guesses, multithreaded
+- **Data Profiler page**: load a CSV/Excel file, get a live health
+  score and donut-chart breakdown of missing values, duplicates, blank
+  rows, extra spaces, and special characters, then export a cleaned copy
 - Adjustable thread counts and timeouts, with warnings if you move away
   from the tested defaults
 - Automatic update checks against GitHub Releases on startup
@@ -99,7 +102,31 @@ files, scanned/image-only PDFs with no extractable text, API timeouts
 (auto-retries with backoff), and invalid API keys (stops immediately
 with a clear message instead of silently failing on every file).
 
-## 4. Support / donation
+## 4. Using the Data Profiler page
+
+Click **🧹 Data Profiler** in the sidebar. This page loads a CSV/Excel
+file, detects common data-quality problems, and lets you export a
+cleaned copy.
+
+1. **Data file** — browse to a `.csv`, `.xlsx`, or `.xls` file.
+2. Click **Analyze**. This populates:
+   - **KPI cards** — Health Score (% of cells that are clean), Total
+     Records, Total Columns, Total Anomalies.
+   - **Anomaly checklist** — Missing Values, Duplicate Rows, Blank
+     Rows, Extra Spaces, Special Characters, and Mixed Data Types,
+     each showing how many cases were found. Only checked boxes get
+     fixed on export.
+   - **Donut chart** — a live visual breakdown; unchecking a box
+     removes it from the chart immediately.
+3. **Mixed Data Types is never auto-fixed** — it's shown for visibility
+   (e.g. a numeric column with a stray text value in it) but is
+   ambiguous enough that it's left for you to review manually rather
+   than guessing what the "correct" fix is.
+4. Click **Clean & Export**, choose where to save (`.xlsx` or `.csv`),
+   and the cleaned file is written and the containing folder opens
+   automatically.
+
+## 5. Support / donation
 
 The app has no paywall or access restrictions — it's free to use.
 There's an optional "Support Development" panel that shows a UPI QR
@@ -115,7 +142,7 @@ feature of UPI itself, not something this (or any) app can hide or
 turn off. This app only controls what's shown inside its own window;
 it can't change what the payer's UPI app displays.
 
-## 5. Distributing to other people (no Python required)
+## 6. Distributing to other people (no Python required)
 
 This is the "deploy it so anyone can use it" part. LinkHarvest ships
 with a GitHub Actions workflow (`.github/workflows/build.yml`) that
@@ -145,28 +172,30 @@ build_exe.bat
 
 This produces `dist\LinkHarvest.exe` with the custom icon baked in.
 
-## 6. Project structure
+## 7. Project structure
 
 ```
 LinkHarvest/
-├── app.py                      # GUI (entry point, both tabs)
+├── app.py                      # GUI (entry point, sidebar + all pages)
 ├── downloader.py                # link scanning + downloading logic
-├── pdf_extractor.py              # PDF text extraction + OpenAI + Excel compilation
-├── donation.py                   # generates the optional UPI donation QR
-├── updater.py                     # checks GitHub Releases for newer versions
-├── version.py                      # current app version (bump before each release)
-├── .env                             # your OpenAI API key (created by the app, git-ignored)
+├── pdf_extractor.py               # PDF text extraction + OpenAI/Gemini + Excel compilation
+├── data_profiler.py                # CSV/Excel data-quality detection + cleaning
+├── donut_chart.py                   # matplotlib donut chart for the Data Profiler page
+├── donation.py                       # generates the optional UPI donation QR
+├── updater.py                         # checks GitHub Releases for newer versions
+├── version.py                          # current app version (bump before each release)
+├── .env                                 # your API key(s) (created by the app, git-ignored)
 ├── assets/
-│   └── icon.ico                      # app icon
+│   └── icon.ico                          # app icon
 ├── .github/
 │   └── workflows/
-│       └── build.yml                  # auto-builds & releases the .exe on tag push
+│       └── build.yml                      # auto-builds & releases the .exe on tag push
 ├── requirements.txt
-├── build_exe.bat                    # builds a Windows .exe locally
+├── build_exe.bat                        # builds a Windows .exe locally
 └── .gitignore
 ```
 
-## 7. Publishing to GitHub
+## 8. Publishing to GitHub
 
 ```cmd
 cd linkharvest
