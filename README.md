@@ -14,10 +14,20 @@ Originally a VBA macro (`Download_All_Row_Images`), rebuilt in Python with:
   Excel sheet — accurate, never guesses, multithreaded
 - **Data Profiler page**: load a CSV/Excel file, get a live health
   score and donut-chart breakdown of missing values, duplicates, blank
-  rows, extra spaces, and special characters, then export a cleaned copy
+  rows, extra spaces, and special characters, optionally fill missing
+  numeric cells with that column's mean, then export a cleaned copy
 - **Excel Editor page**: load a spreadsheet, describe an edit in plain
   English (e.g. "remove cancelled rows and sort by date"), and apply
   it directly to the sheet — with full undo/redo and a save button
+- **Dashboard Builder page**: load a CSV/Excel file and get a reference
+  dashboard — every column is classified (numeric/categorical/date/ID),
+  a chart type is suggested for each with a plain-English reason, a
+  live preview renders in-app, and it exports to a real, editable Excel
+  workbook with native charts plus an AI-written summary of the logic
+- **AI Assistant page**: a Copilot-style helper — attach up to 3 images
+  (a table screenshot, a schema, an error message, a sketch) and describe
+  what to write; it reads the images and generates SQL, DAX, Python,
+  Excel formulas, VBA, or anything else you ask for
 - Adjustable thread counts and timeouts, with warnings if you move away
   from the tested defaults
 - Automatic update checks against GitHub Releases on startup
@@ -125,11 +135,78 @@ cleaned copy.
    (e.g. a numeric column with a stray text value in it) but is
    ambiguous enough that it's left for you to review manually rather
    than guessing what the "correct" fix is.
-4. Click **Clean & Export**, choose where to save (`.xlsx` or `.csv`),
+4. **Fill missing values with column mean** — a separate checkbox below
+   the anomaly list. It only ever touches numeric columns (a text column
+   has no valid "average" to fall back on), filling each missing numeric
+   cell with that column's mean rounded to 2 decimals. Run this before
+   checking "Missing Values" if you want numeric gaps filled instead of
+   those rows being dropped — any remaining non-numeric gaps are still
+   handled by the "Missing Values" checkbox as before.
+5. Click **Clean & Export**, choose where to save (`.xlsx` or `.csv`),
    and the cleaned file is written and the containing folder opens
    automatically.
 
-## 5. Using the Excel Editor page
+## 5. Using the Dashboard Builder page
+
+Click **📊 Dashboard Builder** in the sidebar. This page turns any data
+file into a reference dashboard — a starting point you can restyle in
+Excel, not a finished polished report.
+
+1. **Data file** — browse to a `.csv`, `.xlsx`, or `.xls` file.
+2. **AI Engine** — reuses whichever key/model you already saved on the
+   PDF Extractor page automatically; the AI is only used to write the
+   plain-English summary, so this step is optional (uncheck "Also write
+   an AI summary..." to skip it entirely and still get the charts).
+3. Click **Build Dashboard Plan**. This runs three things:
+   - **Column Classification** — every column is tagged as datetime,
+     numeric, categorical, identifier, or text, based on its data type
+     and how many distinct values it has.
+   - **Suggested Charts** — a chart type is proposed per column
+     (or column pair) using standard rules of thumb: a date column plus
+     a numeric one becomes a line chart (trend over time), a low-cardinality
+     category becomes a bar or pie chart, a numeric column on its own becomes
+     a histogram (distribution), and two numeric columns together become a
+     scatter plot (correlation) — each with a one-line reason shown next to it.
+   - **Preview** — a live grid of those charts renders right in the app so
+     you can sanity-check the plan before exporting anything.
+4. **Dashboard Logic — Summary** — if an AI summary was requested, it
+   explains *why* the data was grouped this way and what to watch out for
+   (skewed categories, missing data, etc.) in plain English; if skipped or
+   it fails, the charts and classification above still stand on their own.
+5. Click **Export Dashboard Excel** and choose where to save. Unlike the
+   in-app preview, this produces a real, editable `.xlsx` — a "Data" sheet
+   with your raw rows, a "Dashboard" sheet with native Excel chart objects
+   (restyle/resize/move them like any Excel chart), and a "Summary" sheet
+   with the AI's explanation if one was generated.
+
+## 6. Using the AI Assistant page
+
+Click **🤖 AI Assistant** in the sidebar. This is a Copilot-style helper:
+attach a few images for context, describe what you want written, and it
+generates the logic — in whatever language fits the request.
+
+1. **AI Engine** — reuses whichever key/model you already saved on the
+   PDF Extractor page automatically. Use a vision-capable model (the
+   suggested defaults both support images).
+2. **Attach Images** — up to 3, optional. Screenshots of a spreadsheet,
+   a database schema, an error message, a whiteboard sketch of a data
+   flow — anything visual that gives the AI context. You can also ask
+   without any images if the prompt is self-contained.
+3. **What should it write?** — describe the logic you want, e.g.
+   *"Write a SQL query that joins these two tables on customer_id"*,
+   *"Turn this into a DAX measure"*, *"Write the VBA macro that does
+   this"*, or *"Write the pandas code to reproduce this pivot table"*.
+   If you don't name a language, it picks the most obviously appropriate
+   one from the images and says which it chose.
+4. Click **Ask AI Assistant**. The response appears in the box below:
+   a short explanation of the approach, then the code in a fenced block,
+   then (only if useful) a note on edge cases. Click **Copy** to grab it.
+5. Column/table/field names in the generated code are grounded in what's
+   actually visible in your images — if something isn't visible or is
+   ambiguous, the assistant uses a clearly-marked placeholder instead of
+   guessing a name that might not exist.
+
+## 7. Using the Excel Editor page
 
 Click **✏️ Excel Editor** in the sidebar. This page loads a spreadsheet
 into the app and lets you edit it by describing what you want in plain
@@ -163,7 +240,7 @@ English, instead of clicking through menus.
    applied (large sheets show the first 300 rows in the preview, but
    edits and saving always apply to every row).
 
-## 6. Support / donation
+## 8. Support / donation
 
 The app has no paywall or access restrictions — it's free to use.
 There's an optional "Support Development" panel that shows a UPI QR
@@ -179,7 +256,7 @@ feature of UPI itself, not something this (or any) app can hide or
 turn off. This app only controls what's shown inside its own window;
 it can't change what the payer's UPI app displays.
 
-## 7. Distributing to other people (no Python required)
+## 9. Distributing to other people (no Python required)
 
 This is the "deploy it so anyone can use it" part. LinkHarvest ships
 with a GitHub Actions workflow (`.github/workflows/build.yml`) that
@@ -209,7 +286,7 @@ build_exe.bat
 
 This produces `dist\LinkHarvest.exe` with the custom icon baked in.
 
-## 8. Project structure
+## 10. Project structure
 
 ```
 LinkHarvest/
@@ -218,6 +295,8 @@ LinkHarvest/
 ├── pdf_extractor.py               # PDF text extraction + OpenAI/Gemini + Excel compilation
 ├── data_profiler.py                # CSV/Excel data-quality detection + cleaning
 ├── sheet_editor.py                   # Excel Editor: AI edit planning + safe operations + undo/redo
+├── dashboard_builder.py                # Dashboard Builder: column classification + chart plan + Excel export
+├── ai_assistant.py                       # AI Assistant: image+prompt -> SQL/DAX/Python/Excel/VBA logic
 ├── donut_chart.py                   # matplotlib donut chart for the Data Profiler page
 ├── donation.py                       # generates the optional UPI donation QR
 ├── updater.py                         # checks GitHub Releases for newer versions
@@ -233,7 +312,7 @@ LinkHarvest/
 └── .gitignore
 ```
 
-## 9. Publishing to GitHub
+## 11. Publishing to GitHub
 
 ```cmd
 cd linkharvest
@@ -245,4 +324,4 @@ git remote add origin https://github.com/<your-username>/linkharvest.git
 git push -u origin main
 ```
 
-Then follow section 7 above to cut your first release.
+Then follow section 9 above to cut your first release.

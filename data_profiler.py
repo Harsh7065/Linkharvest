@@ -79,6 +79,12 @@ def analyze_data(df: pd.DataFrame) -> dict:
     # 1. Missing values -> count of individual NaN/None cells
     results["missing_values"] = int(df.isna().sum().sum())
 
+    # 1b. Of those, how many sit in numeric columns specifically (these are
+    #     the ones eligible for the "fill with column mean" option below —
+    #     it never applies to text/categorical columns).
+    numeric_cols = df.select_dtypes(include="number").columns
+    results["missing_values_numeric"] = int(df[numeric_cols].isna().sum().sum()) if len(numeric_cols) else 0
+
     # 2. Duplicate rows (excluding the first occurrence of each dupe set)
     results["duplicate_rows"] = int(df.duplicated(keep="first").sum())
 
@@ -125,7 +131,9 @@ def analyze_data(df: pd.DataFrame) -> dict:
     results["total_columns"] = int(len(df.columns))
     total_anomalies = sum(
         v for k, v in results.items()
-        if k not in ("total_records", "total_columns")
+        # "missing_values_numeric" is a subset of "missing_values", not a
+        # separate anomaly type, so it must not be double-counted here.
+        if k not in ("total_records", "total_columns", "missing_values_numeric")
     )
     results["total_anomalies"] = total_anomalies
 
@@ -184,8 +192,22 @@ def clean_data(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         for col in cleaned.select_dtypes(include="object").columns:
             cleaned[col] = cleaned[col].apply(_strip_special)
 
+    if filters.get("fill_missing_numeric_mean"):
+        # Numeric-only: fill missing cells with that column's mean. Never
+        # touches text/categorical columns — an ambiguous string column has
+        # no valid "average" to fall back on, so those are left for the
+        # missing_values / manual-review path below.
+        for col in cleaned.select_dtypes(include="number").columns:
+            if cleaned[col].isna().any():
+                mean_val = cleaned[col].mean()
+                if pd.notna(mean_val):
+                    cleaned[col] = cleaned[col].fillna(round(mean_val, 2))
+
     if filters.get("missing_values"):
-        # Drop rows that still contain any missing value after the above fixes.
+        # Drop rows that still contain any missing value after the above fixes
+        # (numeric columns may already be filled by fill_missing_numeric_mean
+        # above, so this only removes rows still missing a non-numeric value —
+        # unless that option wasn't used, in which case it behaves as before).
         cleaned = cleaned.dropna(how="any")
 
     return cleaned.reset_index(drop=True)

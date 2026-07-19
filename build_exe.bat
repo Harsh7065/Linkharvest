@@ -11,6 +11,7 @@ pyinstaller --noconfirm --onefile --windowed ^
   --collect-all openai ^
   --collect-all google.generativeai ^
   --collect-all matplotlib ^
+  --collect-all openpyxl ^
   --name LinkHarvest ^
   app.py
 
