@@ -15,6 +15,9 @@ Originally a VBA macro (`Download_All_Row_Images`), rebuilt in Python with:
 - **Data Profiler page**: load a CSV/Excel file, get a live health
   score and donut-chart breakdown of missing values, duplicates, blank
   rows, extra spaces, and special characters, then export a cleaned copy
+- **Excel Editor page**: load a spreadsheet, describe an edit in plain
+  English (e.g. "remove cancelled rows and sort by date"), and apply
+  it directly to the sheet — with full undo/redo and a save button
 - Adjustable thread counts and timeouts, with warnings if you move away
   from the tested defaults
 - Automatic update checks against GitHub Releases on startup
@@ -126,7 +129,41 @@ cleaned copy.
    and the cleaned file is written and the containing folder opens
    automatically.
 
-## 5. Support / donation
+## 5. Using the Excel Editor page
+
+Click **✏️ Excel Editor** in the sidebar. This page loads a spreadsheet
+into the app and lets you edit it by describing what you want in plain
+English, instead of clicking through menus.
+
+1. **Spreadsheet** — browse to a `.csv`, `.xlsx`, or `.xls` file and
+   click **Load**. If the workbook has multiple sheets, pick which one
+   to work on from the **Sheet** dropdown — each sheet has its own
+   independent undo history.
+2. **AI Engine** — this reuses whichever key/model you already saved
+   on the PDF Extractor page automatically; switch engine or key here
+   only if you want this page to use something different.
+3. **Describe the edit** — type what you want changed, e.g. "remove
+   rows where Status is Cancelled, then sort by Date descending",
+   "fill missing values in the Score column with the average", or
+   "add a column called Total that's Price times Quantity". Click
+   **Apply Edit**.
+4. The AI never writes or runs arbitrary code — it maps your
+   instruction onto a fixed set of safe operations (rename/drop a
+   column, filter or sort rows, add a computed column, fill missing
+   values, replace values, remove duplicates, change text case, round
+   numbers, convert a column's type, and a few more). If it can't map
+   your instruction to one of these, it explains why instead of
+   guessing.
+5. **↶ Undo / ↷ Redo** — every applied edit can be undone (and redone)
+   per sheet, so it's safe to experiment.
+6. **💾 Save** writes back to the file you loaded; **Save As...** lets
+   you save a copy instead (`.xlsx` keeps every sheet, `.csv` only
+   works if the workbook has a single sheet).
+7. The **Sheet Preview** table shows your data live as edits are
+   applied (large sheets show the first 300 rows in the preview, but
+   edits and saving always apply to every row).
+
+## 6. Support / donation
 
 The app has no paywall or access restrictions — it's free to use.
 There's an optional "Support Development" panel that shows a UPI QR
@@ -142,7 +179,7 @@ feature of UPI itself, not something this (or any) app can hide or
 turn off. This app only controls what's shown inside its own window;
 it can't change what the payer's UPI app displays.
 
-## 6. Distributing to other people (no Python required)
+## 7. Distributing to other people (no Python required)
 
 This is the "deploy it so anyone can use it" part. LinkHarvest ships
 with a GitHub Actions workflow (`.github/workflows/build.yml`) that
@@ -172,7 +209,7 @@ build_exe.bat
 
 This produces `dist\LinkHarvest.exe` with the custom icon baked in.
 
-## 7. Project structure
+## 8. Project structure
 
 ```
 LinkHarvest/
@@ -180,6 +217,7 @@ LinkHarvest/
 ├── downloader.py                # link scanning + downloading logic
 ├── pdf_extractor.py               # PDF text extraction + OpenAI/Gemini + Excel compilation
 ├── data_profiler.py                # CSV/Excel data-quality detection + cleaning
+├── sheet_editor.py                   # Excel Editor: AI edit planning + safe operations + undo/redo
 ├── donut_chart.py                   # matplotlib donut chart for the Data Profiler page
 ├── donation.py                       # generates the optional UPI donation QR
 ├── updater.py                         # checks GitHub Releases for newer versions
@@ -195,7 +233,7 @@ LinkHarvest/
 └── .gitignore
 ```
 
-## 8. Publishing to GitHub
+## 9. Publishing to GitHub
 
 ```cmd
 cd linkharvest
@@ -207,4 +245,4 @@ git remote add origin https://github.com/<your-username>/linkharvest.git
 git push -u origin main
 ```
 
-Then follow section 4 above to cut your first release.
+Then follow section 7 above to cut your first release.

@@ -10,8 +10,9 @@ import queue
 import subprocess
 import webbrowser
 
+import pandas as pd
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image
 
 from downloader import load_sheet, build_download_tasks, run_downloads
@@ -20,6 +21,7 @@ from updater import check_for_update
 from version import __version__
 import pdf_extractor as pe
 import data_profiler as dp
+import sheet_editor as se
 from donut_chart import render_donut
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -45,6 +47,7 @@ NAV_ITEMS = [
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
     ("data_profiler", "🧹", "Data Profiler"),
+    ("sheet_editor", "✏️", "Excel Editor"),
     ("support", "❤", "Support"),
 ]
 
@@ -66,6 +69,10 @@ class App(ctk.CTk):
         self.pdf_log_queue = queue.Queue()
         self.pdf_thread = None
 
+        self.editor_queue = queue.Queue()
+        self.editor_thread = None
+        self.editor_session = None
+
         self.nav_buttons = {}
         self.pages = {}
         self.current_page = None
@@ -75,6 +82,7 @@ class App(ctk.CTk):
 
         self.after(150, self._poll_log_queue)
         self.after(150, self._poll_pdf_log_queue)
+        self.after(150, self._poll_editor_queue)
         threading.Thread(target=self._check_update_background, daemon=True).start()
 
     # ==================================================================
@@ -98,6 +106,7 @@ class App(ctk.CTk):
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
+        self.pages["sheet_editor"] = self._build_sheet_editor_page(self.content_host)
         self.pages["support"] = self._build_support_page(self.content_host)
 
         for page in self.pages.values():
@@ -889,6 +898,427 @@ class App(ctk.CTk):
             f"{len(self.profiler_df)} rows → {len(cleaned)} rows after cleaning.")
         try:
             folder = os.path.dirname(os.path.abspath(save_path))
+            if os.name == "nt":
+                os.startfile(folder)
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
+
+    # ==================================================================
+    # PAGE: Excel Editor
+    # ==================================================================
+    def _build_sheet_editor_page(self, parent):
+        page, body = self._new_page(
+            parent, "Excel Editor",
+            "Load a spreadsheet, describe an edit in plain English, and apply it — undo, redo, and save when you're happy")
+
+        # --- Load file ---
+        load_frame = ctk.CTkFrame(body, corner_radius=12)
+        load_frame.pack(fill="x", pady=10)
+        self.editor_input_path = self._path_row(load_frame, "Spreadsheet", self._browse_editor_input)
+
+        load_line = ctk.CTkFrame(load_frame, fg_color="transparent")
+        load_line.pack(fill="x", padx=16, pady=(0, 6))
+        ctk.CTkLabel(load_line, text="", width=90).pack(side="left")
+        self.editor_load_btn = ctk.CTkButton(load_line, text="Load", width=90, height=32,
+                                              command=self._load_editor_file)
+        self.editor_load_btn.pack(side="left")
+        ctk.CTkLabel(load_line, text="Sheet", width=50, anchor="w").pack(side="left", padx=(16, 0))
+        self.editor_sheet_selector = ctk.CTkOptionMenu(
+            load_line, values=["—"], width=180, state="disabled",
+            command=self._on_editor_sheet_change)
+        self.editor_sheet_selector.pack(side="left", padx=6)
+        self.editor_load_status = ctk.CTkLabel(load_frame, text="Accepts .csv, .xlsx, .xls",
+                                                font=ctk.CTkFont(size=11), text_color="gray")
+        self.editor_load_status.pack(anchor="w", padx=16, pady=(0, 14))
+
+        # --- AI configuration (reuses the same provider/key setup as PDF Extractor) ---
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12)
+        cfg_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(cfg_frame, text="AI Engine (used to turn your instruction into edits)",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        editor_provider_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        editor_provider_line.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(editor_provider_line, text="AI Engine", width=110, anchor="w").pack(side="left")
+        self.editor_provider_selector = ctk.CTkSegmentedButton(
+            editor_provider_line, values=["Gemini (Flash) — Free tier", "OpenAI (gpt-5)"],
+            command=self._on_editor_provider_change)
+        self.editor_provider_selector.set("Gemini (Flash) — Free tier")
+        self.editor_provider_selector.pack(side="left", fill="x", expand=True, padx=6)
+        self._editor_provider = pe.PROVIDER_GEMINI
+
+        editor_key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        editor_key_line.pack(fill="x", padx=16, pady=(0, 6))
+        self.editor_api_key_field_label = ctk.CTkLabel(editor_key_line, text="Gemini API Key", width=110, anchor="w")
+        self.editor_api_key_field_label.pack(side="left")
+        self.editor_api_key_entry = ctk.CTkEntry(editor_key_line, show="*")
+        self.editor_api_key_entry.pack(side="left", fill="x", expand=True, padx=6)
+        try:
+            existing_key = pe.load_api_key(self._editor_provider)
+            if existing_key:
+                self.editor_api_key_entry.insert(0, existing_key)
+        except Exception:
+            pass
+        ctk.CTkButton(editor_key_line, text="Save", width=70, command=self._save_editor_api_key).pack(side="left")
+
+        self.editor_api_key_status = ctk.CTkLabel(
+            cfg_frame, text="Same key/model already saved for PDF Extractor is reused here automatically.",
+            font=ctk.CTkFont(size=11), text_color="gray")
+        self.editor_api_key_status.pack(anchor="w", padx=16, pady=(0, 12))
+
+        editor_model_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        editor_model_line.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(editor_model_line, text="Model", width=110, anchor="w").pack(side="left")
+        self.editor_model_combo = ctk.CTkComboBox(
+            editor_model_line, values=pe.SUGGESTED_MODELS[self._editor_provider])
+        self.editor_model_combo.set(pe.DEFAULT_GEMINI_MODEL)
+        self.editor_model_combo.pack(side="left", fill="x", expand=True, padx=6)
+
+        self.editor_provider_warning = ctk.CTkLabel(cfg_frame, text="", text_color="#e0a020",
+                                                      font=ctk.CTkFont(size=11), wraplength=650, justify="left")
+        self.editor_provider_warning.pack(anchor="w", padx=16, pady=(0, 10))
+        self._refresh_editor_provider_warning()
+
+        # --- Prompt ---
+        prompt_frame = ctk.CTkFrame(body, corner_radius=12)
+        prompt_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(prompt_frame, text="Describe the edit", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 6))
+        ctk.CTkLabel(prompt_frame,
+                     text="e.g. \"Remove rows where Status is Cancelled, then sort by Date descending\"",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16)
+        self.editor_prompt = ctk.CTkTextbox(prompt_frame, height=70, corner_radius=8)
+        self.editor_prompt.pack(fill="x", padx=16, pady=(4, 6))
+
+        apply_line = ctk.CTkFrame(prompt_frame, fg_color="transparent")
+        apply_line.pack(fill="x", padx=16, pady=(0, 14))
+        self.editor_apply_btn = ctk.CTkButton(apply_line, text="Apply Edit", height=36,
+                                               font=ctk.CTkFont(weight="bold"),
+                                               command=self._start_editor_apply, state="disabled")
+        self.editor_apply_btn.pack(side="left")
+        self.editor_apply_status = ctk.CTkLabel(apply_line, text="Load a spreadsheet first",
+                                                 font=ctk.CTkFont(size=11), text_color="gray")
+        self.editor_apply_status.pack(side="left", padx=12)
+
+        # --- Undo / redo / save toolbar ---
+        toolbar_frame = ctk.CTkFrame(body, corner_radius=12)
+        toolbar_frame.pack(fill="x", pady=10)
+        toolbar_line = ctk.CTkFrame(toolbar_frame, fg_color="transparent")
+        toolbar_line.pack(fill="x", padx=16, pady=12)
+        self.editor_undo_btn = ctk.CTkButton(toolbar_line, text="↶ Undo", width=100,
+                                              command=self._on_editor_undo, state="disabled")
+        self.editor_undo_btn.pack(side="left", padx=(0, 8))
+        self.editor_redo_btn = ctk.CTkButton(toolbar_line, text="↷ Redo", width=100,
+                                              command=self._on_editor_redo, state="disabled")
+        self.editor_redo_btn.pack(side="left", padx=(0, 8))
+        self.editor_save_btn = ctk.CTkButton(toolbar_line, text="💾 Save", width=100,
+                                              command=self._on_editor_save, state="disabled")
+        self.editor_save_btn.pack(side="left", padx=(0, 8))
+        self.editor_saveas_btn = ctk.CTkButton(toolbar_line, text="Save As...", width=100,
+                                                fg_color="transparent", border_width=1,
+                                                text_color=("gray20", "gray85"),
+                                                command=self._on_editor_save_as, state="disabled")
+        self.editor_saveas_btn.pack(side="left")
+
+        # --- Table preview ---
+        table_frame = ctk.CTkFrame(body, corner_radius=12)
+        table_frame.pack(fill="both", expand=True, pady=10)
+        ctk.CTkLabel(table_frame, text="Sheet Preview", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 4), anchor="w", padx=16)
+        self.editor_table_info = ctk.CTkLabel(table_frame, text="No file loaded yet.",
+                                               font=ctk.CTkFont(size=11), text_color="gray")
+        self.editor_table_info.pack(anchor="w", padx=16, pady=(0, 8))
+
+        tree_host = ctk.CTkFrame(table_frame, fg_color="transparent")
+        tree_host.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        self._style_editor_treeview()
+        y_scroll = ttk.Scrollbar(tree_host, orient="vertical")
+        x_scroll = ttk.Scrollbar(tree_host, orient="horizontal")
+        self.editor_tree = ttk.Treeview(
+            tree_host, style="Editor.Treeview", height=14,
+            yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        y_scroll.configure(command=self.editor_tree.yview)
+        x_scroll.configure(command=self.editor_tree.xview)
+        self.editor_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        tree_host.grid_rowconfigure(0, weight=1)
+        tree_host.grid_columnconfigure(0, weight=1)
+
+        # --- Edit log ---
+        log_frame = ctk.CTkFrame(body, corner_radius=12)
+        log_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(log_frame, text="Edit Log", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 6), anchor="w", padx=16)
+        self.editor_log_box = ctk.CTkTextbox(log_frame, height=110, corner_radius=8)
+        self.editor_log_box.pack(fill="x", padx=16, pady=(0, 14))
+
+        return page
+
+    def _style_editor_treeview(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Editor.Treeview",
+                         background="#1f1f1f", fieldbackground="#1f1f1f",
+                         foreground="#e6e6e6", rowheight=26, borderwidth=0)
+        style.configure("Editor.Treeview.Heading",
+                         background="#2b2b2b", foreground="#e6e6e6",
+                         font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Editor.Treeview", background=[("selected", "#3c8cff")])
+
+    def _browse_editor_input(self, entry):
+        path = filedialog.askopenfilename(filetypes=[("Spreadsheet files", "*.csv *.xlsx *.xls")])
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _load_editor_file(self):
+        filepath = self.editor_input_path.get().strip()
+        if not filepath:
+            messagebox.showerror("Missing info", "Please select a spreadsheet file first.")
+            return
+        try:
+            sheets, sheet_order = se.load_workbook(filepath)
+        except ValueError as e:
+            messagebox.showerror("Couldn't load file", str(e))
+            return
+
+        self.editor_session = se.EditSession(filepath, sheets, sheet_order)
+        self.editor_sheet_selector.configure(values=sheet_order, state="normal")
+        self.editor_sheet_selector.set(sheet_order[0])
+        self.editor_log_box.delete("1.0", "end")
+        self.editor_load_status.configure(
+            text=f"Loaded {len(sheet_order)} sheet(s) from {os.path.basename(filepath)}.",
+            text_color="gray")
+        self._refresh_editor_table()
+        self._update_editor_toolbar_state()
+        self.editor_apply_btn.configure(state="normal")
+        self.editor_apply_status.configure(text="Ready", text_color="gray")
+
+    def _on_editor_sheet_change(self, selection):
+        if not self.editor_session:
+            return
+        self.editor_session.set_active_sheet(selection)
+        self._refresh_editor_table()
+        self._update_editor_toolbar_state()
+
+    def _refresh_editor_table(self):
+        tree = self.editor_tree
+        tree.delete(*tree.get_children())
+        if not self.editor_session:
+            tree["columns"] = ()
+            self.editor_table_info.configure(text="No file loaded yet.")
+            return
+
+        df = self.editor_session.df
+        columns = [str(c) for c in df.columns]
+        tree["columns"] = columns
+        tree["show"] = "headings"
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=120, anchor="w", stretch=True)
+
+        preview = df.head(se.MAX_PREVIEW_ROWS)
+        for _, row in preview.iterrows():
+            values = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+            tree.insert("", "end", values=values)
+
+        total_rows = len(df)
+        note = ""
+        if total_rows > se.MAX_PREVIEW_ROWS:
+            note = f" (showing first {se.MAX_PREVIEW_ROWS} — edits and saving still cover all rows)"
+        self.editor_table_info.configure(
+            text=f"'{self.editor_session.active_sheet}' — {total_rows} rows, {len(columns)} columns{note}")
+
+    def _on_editor_provider_change(self, selection):
+        self._editor_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
+                                  else pe.PROVIDER_GEMINI)
+        label = "OpenAI API Key" if self._editor_provider == pe.PROVIDER_OPENAI else "Gemini API Key"
+        self.editor_api_key_field_label.configure(text=label)
+
+        self.editor_api_key_entry.delete(0, "end")
+        try:
+            existing_key = pe.load_api_key(self._editor_provider)
+            if existing_key:
+                self.editor_api_key_entry.insert(0, existing_key)
+        except Exception:
+            pass
+
+        default_model = (pe.DEFAULT_OPENAI_MODEL if self._editor_provider == pe.PROVIDER_OPENAI
+                          else pe.DEFAULT_GEMINI_MODEL)
+        self.editor_model_combo.configure(values=pe.SUGGESTED_MODELS[self._editor_provider])
+        self.editor_model_combo.set(default_model)
+        self._refresh_editor_provider_warning()
+
+    def _refresh_editor_provider_warning(self):
+        if se.is_provider_available(self._editor_provider):
+            self.editor_provider_warning.configure(text="")
+            return
+        pkg = "openai" if self._editor_provider == pe.PROVIDER_OPENAI else "google-generativeai"
+        self.editor_provider_warning.configure(
+            text=f"⚠ The '{pkg}' package isn't installed. Run: pip install {pkg}")
+
+    def _save_editor_api_key(self):
+        key = self.editor_api_key_entry.get().strip()
+        if not key:
+            messagebox.showerror("Missing key", "Please enter an API key first.")
+            return
+        try:
+            pe.save_api_key(key, provider=self._editor_provider)
+            self.editor_api_key_status.configure(text="✓ Key saved to .env", text_color="#3ca34d")
+        except Exception as e:
+            messagebox.showerror("Couldn't save key", str(e))
+
+    def _start_editor_apply(self):
+        if not self.editor_session:
+            messagebox.showerror("Nothing loaded", "Please load a spreadsheet first.")
+            return
+        if self.editor_thread and self.editor_thread.is_alive():
+            messagebox.showinfo("Busy", "An edit is already being applied.")
+            return
+
+        provider = self._editor_provider
+        if not se.is_provider_available(provider):
+            pkg = "openai" if provider == pe.PROVIDER_OPENAI else "google-generativeai"
+            messagebox.showerror("Missing dependency",
+                                  f"The '{pkg}' package isn't installed.\nRun: pip install {pkg}")
+            return
+
+        api_key = self.editor_api_key_entry.get().strip()
+        model_name = self.editor_model_combo.get().strip()
+        instruction = self.editor_prompt.get("1.0", "end").strip()
+
+        if not api_key:
+            messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
+            return
+        if not instruction:
+            messagebox.showerror("Missing info", "Please describe the edit you want.")
+            return
+
+        self.editor_apply_btn.configure(state="disabled", text="Applying...")
+        self.editor_apply_status.configure(text="Thinking through your edit...", text_color="gray")
+
+        self.editor_thread = threading.Thread(
+            target=self._run_editor_apply_job,
+            args=(instruction, provider, api_key, model_name),
+            daemon=True)
+        self.editor_thread.start()
+
+    def _run_editor_apply_job(self, instruction, provider, api_key, model_name):
+        session = self.editor_session
+        try:
+            ops, explanation = se.get_edit_plan(
+                instruction, session.df, session.active_sheet, provider, api_key, model_name=model_name)
+        except se.AuthError as e:
+            self.editor_queue.put(("error", f"Authentication failed: {e}"))
+            return
+        except Exception as e:
+            self.editor_queue.put(("error", f"Couldn't plan the edit: {e}"))
+            return
+
+        if not ops:
+            self.editor_queue.put(("info", explanation or "The AI didn't suggest any changes for that instruction."))
+            return
+
+        try:
+            session.apply(ops, instruction=instruction, explanation=explanation)
+        except se.OperationError as e:
+            self.editor_queue.put(("error", f"Couldn't apply the suggested edit: {e}"))
+            return
+
+        self.editor_queue.put(("applied", (instruction, explanation, ops)))
+
+    def _poll_editor_queue(self):
+        try:
+            while True:
+                kind, payload = self.editor_queue.get_nowait()
+                if kind == "applied":
+                    instruction, explanation, ops = payload
+                    self._refresh_editor_table()
+                    self._update_editor_toolbar_state()
+                    self.editor_log_box.insert(
+                        "end", f"✓ \"{instruction}\"\n   → {explanation}\n")
+                    self.editor_log_box.see("end")
+                    self.editor_apply_status.configure(text="Applied", text_color="#3ca34d")
+                    self.editor_prompt.delete("1.0", "end")
+                elif kind == "info":
+                    self.editor_log_box.insert("end", f"ℹ {payload}\n")
+                    self.editor_log_box.see("end")
+                    self.editor_apply_status.configure(text="No changes made", text_color="#e0a020")
+                elif kind == "error":
+                    self.editor_log_box.insert("end", f"✗ {payload}\n")
+                    self.editor_log_box.see("end")
+                    self.editor_apply_status.configure(text="Failed — see log", text_color="#e05050")
+                if kind in ("applied", "info", "error"):
+                    self.editor_apply_btn.configure(state="normal", text="Apply Edit")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_editor_queue)
+
+    def _update_editor_toolbar_state(self):
+        if not self.editor_session:
+            for btn in (self.editor_undo_btn, self.editor_redo_btn,
+                        self.editor_save_btn, self.editor_saveas_btn):
+                btn.configure(state="disabled")
+            return
+        self.editor_undo_btn.configure(state="normal" if self.editor_session.can_undo() else "disabled")
+        self.editor_redo_btn.configure(state="normal" if self.editor_session.can_redo() else "disabled")
+        self.editor_save_btn.configure(state="normal")
+        self.editor_saveas_btn.configure(state="normal")
+
+    def _on_editor_undo(self):
+        try:
+            self.editor_session.undo()
+        except se.OperationError as e:
+            messagebox.showinfo("Nothing to undo", str(e))
+            return
+        self._refresh_editor_table()
+        self._update_editor_toolbar_state()
+        self.editor_log_box.insert("end", f"↶ Undid last edit on '{self.editor_session.active_sheet}'\n")
+        self.editor_log_box.see("end")
+
+    def _on_editor_redo(self):
+        try:
+            self.editor_session.redo()
+        except se.OperationError as e:
+            messagebox.showinfo("Nothing to redo", str(e))
+            return
+        self._refresh_editor_table()
+        self._update_editor_toolbar_state()
+        self.editor_log_box.insert("end", f"↷ Redid last edit on '{self.editor_session.active_sheet}'\n")
+        self.editor_log_box.see("end")
+
+    def _on_editor_save(self):
+        if not self.editor_session:
+            return
+        try:
+            saved_path = self.editor_session.save()
+        except ValueError as e:
+            messagebox.showerror("Couldn't save file", str(e))
+            return
+        messagebox.showinfo("Saved", f"Saved to:\n{saved_path}")
+
+    def _on_editor_save_as(self):
+        if not self.editor_session:
+            return
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv")])
+        if not save_path:
+            return
+        try:
+            saved_path = self.editor_session.save(save_path)
+        except ValueError as e:
+            messagebox.showerror("Couldn't save file", str(e))
+            return
+        messagebox.showinfo("Saved", f"Saved to:\n{saved_path}")
+        try:
+            folder = os.path.dirname(os.path.abspath(saved_path))
             if os.name == "nt":
                 os.startfile(folder)
             else:
