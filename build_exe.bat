@@ -7,7 +7,7 @@ pip install cython
 
 echo.
 echo === Step 1: Compiling backend modules with Cython ===
-python setup.py build_ext --inplace
+python setup.py build_ext --inplace --compiler=mingw32
 if errorlevel 1 (
     echo Cython build FAILED - stopping before packaging.
     exit /b 1
@@ -33,6 +33,9 @@ pyinstaller --noconfirm --onefile --windowed ^
   --collect-all google.generativeai ^
   --collect-all matplotlib ^
   --collect-all openpyxl ^
+  --collect-all qrcode ^
+  --collect-all requests ^
+  --collect-all dotenv ^
   --name LinkHarvest ^
   app.py
 

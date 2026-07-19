@@ -18,7 +18,6 @@ from PIL import Image
 from downloader import load_sheet, build_download_tasks, run_downloads
 from donation import generate_qr_image
 from updater import check_for_update
-from auth import verify_credentials, start_periodic_recheck, AuthError
 from version import __version__
 import pdf_extractor as pe
 import data_profiler as dp
@@ -102,7 +101,7 @@ class App(ctk.CTk):
         self.after(150, self._poll_editor_queue)
         self.after(150, self._poll_dashboard_queue)
         self.after(150, self._poll_assistant_queue)
-        threading.Thread(target=self._check_update_then_login, daemon=True).start()
+        threading.Thread(target=self._check_update_background, daemon=True).start()
 
     # ==================================================================
     # Top-level responsive layout: sidebar (fixed) + content (expands)
@@ -1937,87 +1936,10 @@ class App(ctk.CTk):
     # ==================================================================
     # Update checker (applies to the whole app, shown once on startup)
     # ==================================================================
-    def _check_update_then_login(self):
+    def _check_update_background(self):
         info = check_for_update(__version__)
         if info:
             self.after(0, lambda: self._show_update_prompt(info))
-            return
-        # Only reached if the version check passed - now require sign-in.
-        self.after(0, self._show_login_gate)
-
-    def _show_login_gate(self):
-        """Blocks interaction until valid credentials are entered.
-        Runs after the update check passes. Closing this dialog quits
-        the app, same behavior as the update-required dialog."""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Sign In")
-        dialog.geometry("360x260")
-        dialog.resizable(False, False)
-        try:
-            dialog.iconbitmap(ICON_PATH)
-        except Exception:
-            pass
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.protocol("WM_DELETE_WINDOW", self.destroy)
-
-        ctk.CTkLabel(dialog, text="🔒 Sign In Required",
-                     font=ctk.CTkFont(size=17, weight="bold")).pack(pady=(24, 12))
-
-        id_entry = ctk.CTkEntry(dialog, placeholder_text="ID")
-        id_entry.pack(padx=32, fill="x", pady=(0, 8))
-        pwd_entry = ctk.CTkEntry(dialog, placeholder_text="Password", show="*")
-        pwd_entry.pack(padx=32, fill="x")
-
-        status = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11), text_color="#e05555")
-        status.pack(pady=(6, 0))
-
-        def attempt_login():
-            uid, pwd = id_entry.get().strip(), pwd_entry.get()
-            login_btn.configure(state="disabled", text="Checking...")
-
-            def do_check():
-                try:
-                    ok = verify_credentials(uid, pwd)
-                except AuthError:
-                    self.after(0, lambda: status.configure(
-                        text="Can't reach license server - check your connection."))
-                    self.after(0, lambda: login_btn.configure(state="normal", text="Sign In"))
-                    return
-                if ok:
-                    def on_success():
-                        dialog.grab_release()
-                        dialog.destroy()
-                        start_periodic_recheck(
-                            uid, pwd,
-                            on_revoked=lambda: self.after(0, self._force_quit_revoked)
-                        )
-                    self.after(0, on_success)
-                else:
-                    self.after(0, lambda: status.configure(text="Invalid ID or password."))
-                    self.after(0, lambda: login_btn.configure(state="normal", text="Sign In"))
-
-            threading.Thread(target=do_check, daemon=True).start()
-
-        login_btn = ctk.CTkButton(dialog, text="Sign In", height=40, command=attempt_login)
-        login_btn.pack(padx=32, pady=16, fill="x")
-        pwd_entry.bind("<Return>", lambda e: attempt_login())
-        dialog.grab_set()
-
-    def _force_quit_revoked(self):
-        """Called from the background recheck thread (auth.py) when
-        access is revoked mid-session - the login was valid at startup
-        but the row was since removed/changed in the sheet."""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Access Revoked")
-        dialog.geometry("360x160")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.protocol("WM_DELETE_WINDOW", self.destroy)
-        ctk.CTkLabel(dialog, text="Your access has been revoked.\nThe app will now close.",
-                     font=ctk.CTkFont(size=13), justify="center").pack(pady=30)
-        self.after(2500, self.destroy)
 
     def _show_update_prompt(self, info):
         target_url = info.get("download_url") or info["url"]

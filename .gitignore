@@ -23,3 +23,10 @@ Thumbs.db
 *.xlsx
 *.xlsm
 downloads/
+
+
+*.pyd
+*.c
+build/
+_py_src_backup/
+dist/
