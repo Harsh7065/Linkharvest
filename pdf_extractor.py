@@ -59,10 +59,19 @@ except ImportError:
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
-OPENAI_MODEL_NAME = "gpt-4o"
-# "-latest" lets Google roll this to their current best Pro model without
-# code changes; override here if you want to pin a specific version.
-GEMINI_MODEL_NAME = "gemini-1.5-pro-latest"
+DEFAULT_OPENAI_MODEL = "gpt-5"
+# "-latest" lets Google auto-roll this without code changes; it currently
+# resolves to Gemini 3.5 Flash.
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+
+# Shown as dropdown suggestions in the UI, but the field is freely editable —
+# both providers rename/retire models often enough that a hardcoded-only
+# list would go stale. Check https://platform.openai.com/docs/models or
+# https://ai.google.dev/gemini-api/docs/models for the current lineup.
+SUGGESTED_MODELS = {
+    PROVIDER_OPENAI: ["gpt-5", "gpt-5-mini", "gpt-5-nano"],
+    PROVIDER_GEMINI: ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"],
+}
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2  # doubles each retry: 2s, 4s, 8s
@@ -181,12 +190,12 @@ def _parse_json_object(raw_text: str) -> dict:
 # --------------------------------------------------------------------------
 # OpenAI structured extraction
 # --------------------------------------------------------------------------
-def _call_openai_extract(client, instructions: str, pdf_text: str) -> dict:
+def _call_openai_extract(client, model_name: str, instructions: str, pdf_text: str) -> dict:
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.chat.completions.create(
-                model=OPENAI_MODEL_NAME,
+                model=model_name,
                 messages=[
                     {"role": "system", "content": _build_system_prompt()},
                     {"role": "user", "content": _build_user_prompt(instructions, pdf_text)},
@@ -210,7 +219,9 @@ def _call_openai_extract(client, instructions: str, pdf_text: str) -> dict:
                 continue
             raise RuntimeError(f"Model returned invalid JSON after {MAX_RETRIES} attempts: {e}")
         except OpenAIAPIError as e:
-            raise RuntimeError(f"OpenAI API error: {e}")
+            # Includes "model not found" style errors if a bad/retired model
+            # string was typed into the model field — surface it clearly.
+            raise RuntimeError(f"OpenAI API error (check the model name '{model_name}' is valid): {e}")
     raise RuntimeError(f"Extraction failed: {last_error}")
 
 
@@ -269,23 +280,25 @@ def _call_gemini_extract(model, instructions: str, pdf_text: str) -> dict:
 # --------------------------------------------------------------------------
 # Provider dispatch
 # --------------------------------------------------------------------------
-def _make_client(provider: str, api_key: str):
+def _make_client(provider: str, api_key: str, model_name: str):
     """Builds whatever object the per-file worker needs to call the API."""
     if provider == PROVIDER_OPENAI:
         return OpenAI(api_key=api_key)
     elif provider == PROVIDER_GEMINI:
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(
-            GEMINI_MODEL_NAME,
+            model_name,
             system_instruction=_build_system_prompt(),
         )
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def _call_ai_extract(provider: str, client, instructions: str, pdf_text: str) -> dict:
+def _call_ai_extract(provider: str, client, model_name: str, instructions: str, pdf_text: str) -> dict:
     if provider == PROVIDER_OPENAI:
-        return _call_openai_extract(client, instructions, pdf_text)
+        return _call_openai_extract(client, model_name, instructions, pdf_text)
     elif provider == PROVIDER_GEMINI:
+        # model_name is already baked into `client` (a GenerativeModel) at
+        # construction time in _make_client, so it's unused here.
         return _call_gemini_extract(client, instructions, pdf_text)
     raise ValueError(f"Unknown provider: {provider}")
 
@@ -293,7 +306,7 @@ def _call_ai_extract(provider: str, client, instructions: str, pdf_text: str) ->
 # --------------------------------------------------------------------------
 # Per-file processing + thread pool orchestration
 # --------------------------------------------------------------------------
-def _process_single_pdf(pdf_path: str, instructions: str, provider: str, client) -> dict:
+def _process_single_pdf(pdf_path: str, instructions: str, provider: str, model_name: str, client) -> dict:
     """
     Returns a result dict always containing 'Source File' plus whatever
     fields the model returned (or an '_error' key on failure).
@@ -305,7 +318,7 @@ def _process_single_pdf(pdf_path: str, instructions: str, provider: str, client)
         return {"Source File": filename, "_error": str(e)}
 
     try:
-        data = _call_ai_extract(provider, client, instructions, text)
+        data = _call_ai_extract(provider, client, model_name, instructions, text)
     except AuthError:
         raise  # bubble up immediately, stop the whole run
     except RuntimeError as e:
@@ -318,9 +331,12 @@ def _process_single_pdf(pdf_path: str, instructions: str, provider: str, client)
 
 
 def run_extraction(pdf_paths, instructions: str, provider: str, api_key: str,
-                    max_workers: int, progress_cb, log_cb):
+                    max_workers: int, progress_cb, log_cb, model_name: str = None):
     """
     provider: PROVIDER_OPENAI or PROVIDER_GEMINI.
+    model_name: which model string to send to the provider's API. If left
+        blank/None, falls back to that provider's default (see
+        DEFAULT_OPENAI_MODEL / DEFAULT_GEMINI_MODEL above).
     progress_cb(done, total) called after every completed file.
     log_cb(message) called for start/skip/error/found-partial events.
     Returns list of result dicts (one per PDF, in completion order).
@@ -334,14 +350,18 @@ def run_extraction(pdf_paths, instructions: str, provider: str, api_key: str,
     if not api_key:
         raise AuthError(f"No {provider.title()} API key configured.")
 
-    client = _make_client(provider, api_key)
+    model_name = (model_name or "").strip()
+    if not model_name:
+        model_name = DEFAULT_OPENAI_MODEL if provider == PROVIDER_OPENAI else DEFAULT_GEMINI_MODEL
+
+    client = _make_client(provider, api_key, model_name)
     results = []
     total = len(pdf_paths)
     done = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_path = {
-            executor.submit(_process_single_pdf, path, instructions, provider, client): path
+            executor.submit(_process_single_pdf, path, instructions, provider, model_name, client): path
             for path in pdf_paths
         }
         for future in as_completed(future_to_path):

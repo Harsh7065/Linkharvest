@@ -400,18 +400,28 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
 
         provider_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
-        provider_line.pack(fill="x", padx=16, pady=(0, 10))
+        provider_line.pack(fill="x", padx=16, pady=(0, 4))
         ctk.CTkLabel(provider_line, text="AI Engine", width=110, anchor="w").pack(side="left")
         self.provider_selector = ctk.CTkSegmentedButton(
-            provider_line, values=["OpenAI (gpt-4o)", "Gemini (1.5 Pro)"],
+            provider_line, values=["Gemini (Flash) — Free tier", "OpenAI (gpt-5)"],
             command=self._on_provider_change)
-        self.provider_selector.set("OpenAI (gpt-4o)")
+        self.provider_selector.set("Gemini (Flash) — Free tier")
         self.provider_selector.pack(side="left", fill="x", expand=True, padx=6)
-        self._pdf_provider = pe.PROVIDER_OPENAI  # internal state, kept in sync with the selector
+        self._pdf_provider = pe.PROVIDER_GEMINI  # internal state, kept in sync with the selector
+
+        get_key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        get_key_line.pack(fill="x", padx=16, pady=(0, 10))
+        ctk.CTkLabel(get_key_line, text="", width=110).pack(side="left")
+        self.get_key_btn = ctk.CTkButton(
+            get_key_line, text="🔗 Get a free Gemini API key", width=220, height=26,
+            font=ctk.CTkFont(size=11), fg_color="transparent", border_width=1,
+            text_color=("gray20", "gray85"),
+            command=self._open_key_signup_page)
+        self.get_key_btn.pack(side="left")
 
         key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
         key_line.pack(fill="x", padx=16, pady=(0, 6))
-        self.api_key_field_label = ctk.CTkLabel(key_line, text="OpenAI API Key", width=110, anchor="w")
+        self.api_key_field_label = ctk.CTkLabel(key_line, text="Gemini API Key", width=110, anchor="w")
         self.api_key_field_label.pack(side="left")
         self.api_key_entry = ctk.CTkEntry(key_line, show="*")
         self.api_key_entry.pack(side="left", fill="x", expand=True, padx=6)
@@ -426,6 +436,19 @@ class App(ctk.CTk):
         self.api_key_status = ctk.CTkLabel(cfg_frame, text="Key is stored locally in a .env file, never uploaded anywhere.",
                                             font=ctk.CTkFont(size=11), text_color="gray")
         self.api_key_status.pack(anchor="w", padx=16, pady=(0, 12))
+
+        model_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        model_line.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(model_line, text="Model", width=110, anchor="w").pack(side="left")
+        self.model_combo = ctk.CTkComboBox(
+            model_line, values=pe.SUGGESTED_MODELS[self._pdf_provider])
+        self.model_combo.set(pe.DEFAULT_GEMINI_MODEL)
+        self.model_combo.pack(side="left", fill="x", expand=True, padx=6)
+        ctk.CTkLabel(model_line, text="", width=70).pack(side="left")  # align with Save button above
+
+        ctk.CTkLabel(cfg_frame,
+                     text="Pick from the list or type any model name (e.g. gemini-flash-lite-latest for lower cost/faster).",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16, pady=(0, 12))
 
         self.provider_warning = ctk.CTkLabel(cfg_frame, text="", text_color="#e0a020",
                                               font=ctk.CTkFont(size=11), wraplength=650, justify="left")
@@ -523,7 +546,23 @@ class App(ctk.CTk):
         self.api_key_status.configure(
             text="Key is stored locally in a .env file, never uploaded anywhere.",
             text_color="gray")
+
+        # Swap the model dropdown's suggestions + default for the new provider.
+        default_model = (pe.DEFAULT_OPENAI_MODEL if self._pdf_provider == pe.PROVIDER_OPENAI
+                          else pe.DEFAULT_GEMINI_MODEL)
+        self.model_combo.configure(values=pe.SUGGESTED_MODELS[self._pdf_provider])
+        self.model_combo.set(default_model)
+
+        key_label = "OpenAI" if self._pdf_provider == pe.PROVIDER_OPENAI else "Gemini"
+        free_note = " (free)" if self._pdf_provider == pe.PROVIDER_GEMINI else ""
+        self.get_key_btn.configure(text=f"🔗 Get a{free_note} {key_label} API key")
+
         self._refresh_provider_availability_warning()
+
+    def _open_key_signup_page(self):
+        url = ("https://aistudio.google.com/apikey" if self._pdf_provider == pe.PROVIDER_GEMINI
+               else "https://platform.openai.com/api-keys")
+        webbrowser.open(url)
 
     def _refresh_provider_availability_warning(self):
         if pe.is_provider_available(self._pdf_provider):
@@ -557,6 +596,7 @@ class App(ctk.CTk):
             return
 
         api_key = self.api_key_entry.get().strip()
+        model_name = self.model_combo.get().strip()
         instructions = self.pdf_instructions.get("1.0", "end").strip()
         source_folder = self.pdf_source_folder.get().strip()
         output_excel = self.pdf_output_excel.get().strip()
@@ -591,13 +631,13 @@ class App(ctk.CTk):
 
         self.pdf_thread = threading.Thread(
             target=self._run_pdf_extraction_job,
-            args=(pdfs, instructions, provider, api_key, threads, output_excel, sheet_name),
+            args=(pdfs, instructions, provider, api_key, model_name, threads, output_excel, sheet_name),
             daemon=True)
         self.pdf_thread.start()
 
-    def _run_pdf_extraction_job(self, pdfs, instructions, provider, api_key, threads, output_excel, sheet_name):
+    def _run_pdf_extraction_job(self, pdfs, instructions, provider, api_key, model_name, threads, output_excel, sheet_name):
         engine_name = "OpenAI" if provider == pe.PROVIDER_OPENAI else "Gemini"
-        self.pdf_log_queue.put(("info", f"Found {len(pdfs)} PDF(s). Extracting with {engine_name} using {threads} thread(s)..."))
+        self.pdf_log_queue.put(("info", f"Found {len(pdfs)} PDF(s). Extracting with {engine_name} ({model_name}) using {threads} thread(s)..."))
 
         def progress_cb(done, total):
             self.pdf_log_queue.put(("progress", (done, total)))
@@ -606,7 +646,8 @@ class App(ctk.CTk):
             self.pdf_log_queue.put(("warn", msg))
 
         try:
-            results = pe.run_extraction(pdfs, instructions, provider, api_key, threads, progress_cb, log_cb)
+            results = pe.run_extraction(pdfs, instructions, provider, api_key, threads, progress_cb, log_cb,
+                                         model_name=model_name)
         except pe.AuthError as e:
             self.pdf_log_queue.put(("error", f"Authentication failed: {e}"))
             self.pdf_log_queue.put(("done", None))

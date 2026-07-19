@@ -33,6 +33,9 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed `
             --icon=assets\icon.ico `
             --add-data "assets;assets" `
+            --collect-all pdfplumber `
+            --collect-all openai `
+            --collect-all google.generativeai `
             --name LinkHarvest `
             app.py
 

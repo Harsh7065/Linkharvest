@@ -58,28 +58,36 @@ Click **📄 PDF Extractor** in the left sidebar. This page pulls
 structured data out of a folder of PDFs using AI, and compiles the
 results into an Excel sheet.
 
-1. **AI Engine** — choose **OpenAI (gpt-4o)** or **Gemini (1.5 Pro)**.
+1. **AI Engine** — choose **Gemini (Flash tier, free)** or **OpenAI (gpt-5)**.
    Each provider has its own key slot, so switching back and forth
    doesn't overwrite the other's saved key.
-2. **API Key** — paste the key for whichever engine you selected
+2. **Model** — pick from the dropdown or type any model name directly
+   (e.g. `gemini-flash-lite-latest` for lower cost/faster, `gpt-5-mini`
+   for a cheaper OpenAI option). Both providers rename/retire models
+   fairly often, so this field is intentionally free-editable rather
+   than locked to a fixed list — check
+   [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models)
+   or [platform.openai.com/docs/models](https://platform.openai.com/docs/models)
+   for the current lineup if a model stops working.
+3. **API Key** — paste the key for whichever engine you selected
    (OpenAI: platform.openai.com/api-keys · Gemini: aistudio.google.com/apikey)
    and click **Save**. It's written to a local `.env` file in the app
    folder and is never sent anywhere except directly to that provider's
    API — `.env` is git-ignored so it won't accidentally get committed.
-3. **What to extract** — describe the fields in plain English, e.g.
+4. **What to extract** — describe the fields in plain English, e.g.
    `Invoice number, invoice date, vendor name, total amount, payment due date`.
-4. **Source Folder** — the folder containing your `.pdf` files.
-5. **Output Excel / Sheet Name** — where results get written. If the
+5. **Source Folder** — the folder containing your `.pdf` files.
+6. **Output Excel / Sheet Name** — where results get written. If the
    file and sheet already exist, new rows are appended underneath the
    existing data rather than overwriting it.
-6. **Concurrent Threads** (1–20, default 10) — how many PDFs to process
+7. **Concurrent Threads** (1–20, default 10) — how many PDFs to process
    at once. Higher isn't always faster — both providers rate-limit
    requests, so very high thread counts can trigger more retries.
-7. Click **Start Extraction**. The log shows real-time per-file status,
+8. Click **Start Extraction**. The log shows real-time per-file status,
    including which fields weren't found in a given document (the model
    is instructed to never guess — a blank cell means it genuinely
    wasn't in the PDF).
-8. On completion, a success popup appears and the output folder opens
+9. On completion, a success popup appears and the output folder opens
    automatically.
 
 **Costs money to run:** each PDF sent to OpenAI or Gemini consumes API
