@@ -20,6 +20,7 @@ https://raw.githubusercontent.com/<you>/<repo>/main/control.json):
   paid/licensed software) instead of a free tool where you don't want a
   flaky connection to lock out a legit user.
 """
+import time
 import requests
 
 CONTROL_URL = "https://raw.githubusercontent.com/Harsh7065/Linkharvest/main/control.json"
@@ -44,7 +45,13 @@ def check_authorization(current_version: str):
     Call this once at startup, before the main window is built.
     """
     try:
-        resp = requests.get(CONTROL_URL, timeout=TIMEOUT)
+        # cache-busting: GitHub's raw-file CDN caches responses at the edge
+        # for several minutes, and different requests can even hit different
+        # cache nodes. Appending a changing query param forces a fresh fetch
+        # every time instead of risking a stale "active" value.
+        bust = int(time.time())
+        url = f"{CONTROL_URL}?_={bust}"
+        resp = requests.get(url, timeout=TIMEOUT, headers={"Cache-Control": "no-cache"})
         if resp.status_code != 200:
             return (not FAIL_CLOSED, None)
 
