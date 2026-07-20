@@ -1,5 +1,5 @@
 {
-  "active": true,
-  "min_version": "1.2.3",
+  "active": false,
+  "min_version": "1.2.4",
   "message": "A required update is available. Please download the latest version from GitHub Releases."
 }
