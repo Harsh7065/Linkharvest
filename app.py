@@ -18,6 +18,7 @@ from PIL import Image
 from downloader import load_sheet, build_download_tasks, run_downloads
 from donation import generate_qr_image
 from updater import check_for_update
+from remote_auth import check_authorization
 from version import __version__
 import pdf_extractor as pe
 import data_profiler as dp
@@ -1982,5 +1983,17 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
+    allowed, block_message = check_authorization(__version__)
+    if not allowed:
+        import tkinter as tk
+        from tkinter import messagebox as _mb
+        _root = tk.Tk()
+        _root.withdraw()  # no blank window behind the popup
+        _mb.showerror("LinkHarvest",
+                       block_message or "This version of LinkHarvest is no longer available. "
+                                        "Please download the latest version.")
+        _root.destroy()
+        raise SystemExit(0)
+
     app = App()
     app.mainloop()
