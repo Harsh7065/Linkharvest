@@ -1,1 +1,24 @@
-.
+name: Test LinkHarvest Executable
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download LinkHarvest.exe
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/Harsh7065/Linkharvest/releases/download/v1.3.2/LinkHarvest.exe" -OutFile "LinkHarvest.exe"
+        shell: pwsh
+
+      - name: Verify file exists and check size
+        run: |
+          Get-Item "LinkHarvest.exe"
+        shell: pwsh
+
+      - name: Run Executable
+        run: |
+          .\LinkHarvest.exe --help
+        shell: pwsh
