@@ -9,6 +9,7 @@ import threading
 import queue
 import subprocess
 import webbrowser
+import multiprocessing
 
 import pandas as pd
 import customtkinter as ctk
@@ -25,6 +26,7 @@ import data_profiler as dp
 import sheet_editor as se
 import dashboard_builder as db
 import ai_assistant as aa
+import copilot as cp
 from donut_chart import render_donut
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -40,13 +42,21 @@ ICON_PATH = os.path.join(BASE_DIR, "assets", "icon.ico")
 
 SIDEBAR_WIDTH = 230
 ACCENT = ("#1f6feb", "#3c8cff")
-SIDEBAR_BG = ("gray92", "gray14")
+SIDEBAR_BG = ("gray92", "#0d1b2e")
 SIDEBAR_BTN_INACTIVE = "transparent"
-SIDEBAR_BTN_HOVER = ("gray85", "gray22")
+SIDEBAR_BTN_HOVER = ("gray85", "#16273f")
+
+# Premium theme: deep navy canvas with soft blue-bordered cards, to match
+# the reference design (rounded panels with a subtle accent outline
+# instead of flat gray boxes).
+APP_BG = ("gray95", "#0b1626")
+CARD_BG = ("gray97", "#101f36")
+CARD_BORDER = ("#c7d7f5", "#1f3a5f")
 
 # Each entry here is one row in the sidebar. Add a tuple to this list to
 # register a new feature/page without touching the layout code.
 NAV_ITEMS = [
+    ("ai_copilot", "🤖", "AI Copilot"),
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
     ("data_profiler", "🧹", "Data Profiler"),
@@ -63,10 +73,21 @@ class App(ctk.CTk):
         self.title(f"LinkHarvest v{__version__}")
         self.geometry("1080x760")
         self.minsize(880, 640)
+        self.configure(fg_color=APP_BG)
         try:
             self.iconbitmap(ICON_PATH)
         except Exception:
             pass
+
+        # Open full screen (maximized, not borderless) so the app always
+        # starts at full usable size regardless of the last saved geometry.
+        try:
+            self.state("zoomed")
+        except Exception:
+            try:
+                self.attributes("-zoomed", True)  # some non-Windows Tk builds
+            except Exception:
+                pass
 
         self.log_queue = queue.Queue()
         self.download_thread = None
@@ -90,18 +111,66 @@ class App(ctk.CTk):
         self.assistant_thread = None
         self.assistant_image_entries = []
 
+        self.copilot_queue = queue.Queue()
+        self.copilot_thread = None
+        self.copilot_plan = None
+        self.copilot_step_widgets = []  # list of (step_dict, {param_key: entry_widget})
+        self._copilot_provider = pe.PROVIDER_GEMINI
+
         self.nav_buttons = {}
         self.pages = {}
         self.current_page = None
 
+        # Splash first: shows instantly (fixes the "looks frozen on launch"
+        # problem) but exposes ZERO app functionality — no sidebar, no
+        # pages, nothing clickable — until the authorization check clears.
+        # This closes the gap the previous approach had, where the full
+        # interactive app was built and usable *before* the background
+        # authorization check had a chance to block it.
+        self._build_splash()
+        threading.Thread(target=self._authorize_then_launch, daemon=True).start()
+
+    def _build_splash(self):
+        self.splash_frame = ctk.CTkFrame(self, fg_color=APP_BG, corner_radius=0)
+        self.splash_frame.pack(fill="both", expand=True)
+        center = ctk.CTkFrame(self.splash_frame, fg_color="transparent")
+        center.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(center, text="🔗 LinkHarvest",
+                     font=ctk.CTkFont(size=26, weight="bold")).pack()
+        ctk.CTkLabel(center, text=f"v{__version__}", font=ctk.CTkFont(size=12),
+                     text_color="gray").pack(pady=(4, 16))
+        self.splash_progress = ctk.CTkProgressBar(center, width=220, mode="indeterminate")
+        self.splash_progress.pack()
+        self.splash_progress.start()
+        self.splash_status = ctk.CTkLabel(center, text="Checking for updates...",
+                                           font=ctk.CTkFont(size=11), text_color="gray")
+        self.splash_status.pack(pady=(10, 0))
+
+    def _authorize_then_launch(self):
+        """
+        Runs off the main thread so the splash's progress bar keeps
+        animating. Only once this resolves to "allowed" does the real,
+        interactive app get built — nothing usable exists before then.
+        """
+        allowed, block_message = check_authorization(__version__)
+        if not allowed:
+            self.after(0, lambda: self._show_authorization_block(block_message))
+            return
+        self.after(0, self._finish_launch)
+
+    def _finish_launch(self):
+        self.splash_progress.stop()
+        self.splash_frame.destroy()
+
         self._build_layout()
-        self._show_page("downloader")
+        self._show_page("ai_copilot")
 
         self.after(150, self._poll_log_queue)
         self.after(150, self._poll_pdf_log_queue)
         self.after(150, self._poll_editor_queue)
         self.after(150, self._poll_dashboard_queue)
         self.after(150, self._poll_assistant_queue)
+        self.after(150, self._poll_copilot_queue)
         threading.Thread(target=self._check_update_background, daemon=True).start()
 
     # ==================================================================
@@ -122,6 +191,7 @@ class App(ctk.CTk):
         self.content_host.grid_columnconfigure(0, weight=1)
         self.content_host.grid_rowconfigure(0, weight=1)
 
+        self.pages["ai_copilot"] = self._build_ai_copilot_page(self.content_host)
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
@@ -199,6 +269,299 @@ class App(ctk.CTk):
         return page, body
 
     # ==================================================================
+    # PAGE: AI Copilot — describe a task, get a runnable step-by-step plan
+    # ==================================================================
+    def _build_ai_copilot_page(self, parent):
+        page, body = self._new_page(
+            parent, "AI Copilot",
+            "Describe what you want done in plain English. The AI turns it into a "
+            "step-by-step plan you can review, fill in file paths for, and run.")
+
+        # --- AI configuration (same pattern as the other AI pages) ---
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
+        cfg_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(cfg_frame, text="AI Engine", font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        cop_provider_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        cop_provider_line.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(cop_provider_line, text="AI Engine", width=110, anchor="w").pack(side="left")
+        self.cop_provider_selector = ctk.CTkSegmentedButton(
+            cop_provider_line, values=["Gemini (Flash) — Free tier", "OpenAI (gpt-5)"],
+            command=self._on_cop_provider_change)
+        self.cop_provider_selector.set("Gemini (Flash) — Free tier")
+        self.cop_provider_selector.pack(side="left", fill="x", expand=True, padx=6)
+
+        cop_key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        cop_key_line.pack(fill="x", padx=16, pady=(0, 6))
+        self.cop_api_key_field_label = ctk.CTkLabel(cop_key_line, text="Gemini API Key", width=110, anchor="w")
+        self.cop_api_key_field_label.pack(side="left")
+        self.cop_api_key_entry = ctk.CTkEntry(cop_key_line, show="*")
+        self.cop_api_key_entry.pack(side="left", fill="x", expand=True, padx=6)
+        try:
+            existing_key = pe.load_api_key(self._copilot_provider)
+            if existing_key:
+                self.cop_api_key_entry.insert(0, existing_key)
+        except Exception:
+            pass
+        ctk.CTkButton(cop_key_line, text="Save", width=70, command=self._save_cop_api_key).pack(side="left")
+
+        self.cop_api_key_status = ctk.CTkLabel(
+            cfg_frame, text="Same key already saved elsewhere in the app is reused here automatically.",
+            font=ctk.CTkFont(size=11), text_color="gray")
+        self.cop_api_key_status.pack(anchor="w", padx=16, pady=(0, 12))
+
+        cop_model_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        cop_model_line.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkLabel(cop_model_line, text="Model", width=110, anchor="w").pack(side="left")
+        self.cop_model_combo = ctk.CTkComboBox(cop_model_line, values=pe.SUGGESTED_MODELS[self._copilot_provider])
+        self.cop_model_combo.set(pe.DEFAULT_GEMINI_MODEL)
+        self.cop_model_combo.pack(side="left", fill="x", expand=True, padx=6)
+
+        # --- Instruction box ---
+        instr_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
+        instr_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(instr_frame, text="What do you want to do?", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 6))
+        ctk.CTkLabel(instr_frame,
+                     text="e.g. \"Combine all Excel files from a folder, remove duplicate rows, "
+                          "and build a dashboard\"",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16)
+        self.cop_instruction = ctk.CTkTextbox(instr_frame, height=70, corner_radius=8)
+        self.cop_instruction.pack(fill="x", padx=16, pady=(4, 6))
+
+        plan_line = ctk.CTkFrame(instr_frame, fg_color="transparent")
+        plan_line.pack(fill="x", padx=16, pady=(0, 14))
+        self.cop_plan_btn = ctk.CTkButton(plan_line, text="Plan Workflow", height=36,
+                                           font=ctk.CTkFont(weight="bold"), command=self._start_cop_plan)
+        self.cop_plan_btn.pack(side="left")
+        self.cop_status_label = ctk.CTkLabel(plan_line, text="Ready", font=ctk.CTkFont(size=11), text_color="gray")
+        self.cop_status_label.pack(side="left", padx=12)
+
+        # --- Plan (populated dynamically once the AI responds) ---
+        self.cop_plan_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1,
+                                            border_color=CARD_BORDER, fg_color=CARD_BG)
+        self.cop_plan_frame.pack(fill="x", pady=10)
+        self.cop_plan_header = ctk.CTkLabel(self.cop_plan_frame, text="No plan yet",
+                                             font=ctk.CTkFont(weight="bold", size=14))
+        self.cop_plan_header.pack(pady=(12, 6), anchor="w", padx=16)
+        self.cop_steps_container = ctk.CTkFrame(self.cop_plan_frame, fg_color="transparent")
+        self.cop_steps_container.pack(fill="x", padx=16, pady=(0, 6))
+        self.cop_unsupported_label = ctk.CTkLabel(self.cop_plan_frame, text="", text_color="#e0a020",
+                                                    font=ctk.CTkFont(size=11), wraplength=650, justify="left")
+        self.cop_unsupported_label.pack(anchor="w", padx=16, pady=(0, 10))
+
+        run_line = ctk.CTkFrame(self.cop_plan_frame, fg_color="transparent")
+        run_line.pack(fill="x", padx=16, pady=(0, 14))
+        self.cop_run_btn = ctk.CTkButton(run_line, text="Run Workflow", height=36,
+                                          font=ctk.CTkFont(weight="bold"), state="disabled",
+                                          command=self._start_cop_run)
+        self.cop_run_btn.pack(side="left")
+
+        # --- Log output ---
+        log_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
+        log_frame.pack(fill="both", expand=True, pady=10)
+        ctk.CTkLabel(log_frame, text="Run Log", font=ctk.CTkFont(weight="bold", size=14)
+                     ).pack(pady=(12, 6), anchor="w", padx=16)
+        self.cop_log_box = ctk.CTkTextbox(log_frame, height=220, corner_radius=8, wrap="word")
+        self.cop_log_box.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
+        return page
+
+    def _on_cop_provider_change(self, selection):
+        self._copilot_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
+                                   else pe.PROVIDER_GEMINI)
+        label = "OpenAI API Key" if self._copilot_provider == pe.PROVIDER_OPENAI else "Gemini API Key"
+        self.cop_api_key_field_label.configure(text=label)
+        self.cop_api_key_entry.delete(0, "end")
+        try:
+            existing_key = pe.load_api_key(self._copilot_provider)
+            if existing_key:
+                self.cop_api_key_entry.insert(0, existing_key)
+        except Exception:
+            pass
+        default_model = (pe.DEFAULT_OPENAI_MODEL if self._copilot_provider == pe.PROVIDER_OPENAI
+                          else pe.DEFAULT_GEMINI_MODEL)
+        self.cop_model_combo.configure(values=pe.SUGGESTED_MODELS[self._copilot_provider])
+        self.cop_model_combo.set(default_model)
+
+    def _save_cop_api_key(self):
+        key = self.cop_api_key_entry.get().strip()
+        if not key:
+            messagebox.showerror("Missing key", "Please enter an API key first.")
+            return
+        try:
+            pe.save_api_key(key, provider=self._copilot_provider)
+            self.cop_api_key_status.configure(text="✓ Key saved to .env", text_color="#3ca34d")
+        except Exception as e:
+            messagebox.showerror("Couldn't save key", str(e))
+
+    def _cop_log(self, message):
+        self.copilot_queue.put(("log", message))
+
+    def _start_cop_plan(self):
+        if self.copilot_thread and self.copilot_thread.is_alive():
+            messagebox.showinfo("Busy", "Already working on a request.")
+            return
+        provider = self._copilot_provider
+        api_key = self.cop_api_key_entry.get().strip()
+        model_name = self.cop_model_combo.get().strip()
+        instruction = self.cop_instruction.get("1.0", "end").strip()
+
+        if not api_key:
+            messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
+            return
+        if not instruction:
+            messagebox.showerror("Missing info", "Please describe what you want the workflow to do.")
+            return
+
+        self.cop_plan_btn.configure(state="disabled", text="Thinking...")
+        self.cop_run_btn.configure(state="disabled")
+        self.cop_status_label.configure(text="Understanding your request...", text_color="gray")
+        self.cop_log_box.delete("1.0", "end")
+
+        self.copilot_thread = threading.Thread(
+            target=self._run_cop_plan_job, args=(instruction, provider, api_key, model_name), daemon=True)
+        self.copilot_thread.start()
+
+    def _run_cop_plan_job(self, instruction, provider, api_key, model_name):
+        try:
+            plan = cp.plan_workflow(instruction, provider, api_key, model_name)
+        except pe.AuthError as e:
+            self.copilot_queue.put(("plan_error", f"Authentication failed: {e}"))
+            return
+        except Exception as e:
+            self.copilot_queue.put(("plan_error", f"Couldn't build a plan: {e}"))
+            return
+        self.copilot_queue.put(("plan_done", plan))
+
+    def _render_plan(self, plan):
+        self.copilot_plan = plan
+        self.cop_plan_header.configure(text=plan["workflow_name"])
+
+        for widget in self.cop_steps_container.winfo_children():
+            widget.destroy()
+        self.copilot_step_widgets = []
+
+        if plan.get("clarifying_question"):
+            ctk.CTkLabel(self.cop_steps_container, text=f"❓ {plan['clarifying_question']}",
+                         font=ctk.CTkFont(size=12), text_color="#e0a020", wraplength=650,
+                         justify="left").pack(anchor="w", pady=6)
+            self.cop_run_btn.configure(state="disabled")
+        elif not plan["steps"]:
+            ctk.CTkLabel(self.cop_steps_container, text="No steps were generated.",
+                         font=ctk.CTkFont(size=12), text_color="gray").pack(anchor="w", pady=6)
+            self.cop_run_btn.configure(state="disabled")
+        else:
+            path_hint_keys = ("folder", "path", "workbook_path", "save_folder")
+            for i, step in enumerate(plan["steps"]):
+                step_frame = ctk.CTkFrame(self.cop_steps_container, corner_radius=8,
+                                           fg_color=("gray95", "#0d1b2e"))
+                step_frame.pack(fill="x", pady=4)
+                ctk.CTkLabel(step_frame, text=f"{i + 1}. {step['label']}",
+                             font=ctk.CTkFont(weight="bold", size=13)).pack(anchor="w", padx=12, pady=(8, 4))
+
+                entries = {}
+                for key, val in step["params"].items():
+                    row = ctk.CTkFrame(step_frame, fg_color="transparent")
+                    row.pack(fill="x", padx=12, pady=2)
+                    ctk.CTkLabel(row, text=key, width=140, anchor="w",
+                                 font=ctk.CTkFont(size=11)).pack(side="left")
+                    entry = ctk.CTkEntry(row)
+                    entry.pack(side="left", fill="x", expand=True, padx=6)
+                    if val not in (None, ""):
+                        entry.insert(0, str(val))
+                    is_path_field = any(h in key.lower() for h in path_hint_keys)
+                    if is_path_field:
+                        is_folder = "folder" in key.lower()
+                        browse_cmd = (lambda e=entry, folder=is_folder:
+                                      self._browse_cop_path(e, folder))
+                        ctk.CTkButton(row, text="Browse", width=70, command=browse_cmd).pack(side="left")
+                    entries[key] = entry
+                ctk.CTkFrame(step_frame, height=6, fg_color="transparent").pack()
+                self.copilot_step_widgets.append((step, entries))
+            self.cop_run_btn.configure(state="normal")
+
+        unsupported = plan.get("unsupported") or []
+        if unsupported:
+            self.cop_unsupported_label.configure(
+                text="⚠ Not yet supported, so left out of the plan: " + "; ".join(unsupported))
+        else:
+            self.cop_unsupported_label.configure(text="")
+
+    def _browse_cop_path(self, entry, is_folder):
+        path = filedialog.askdirectory() if is_folder else filedialog.askopenfilename()
+        if not path and not is_folder:
+            # also allow choosing a save location for output_path-style fields
+            path = filedialog.asksaveasfilename(defaultextension=".xlsx")
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _start_cop_run(self):
+        if not self.copilot_plan or not self.copilot_step_widgets:
+            return
+        if self.copilot_thread and self.copilot_thread.is_alive():
+            messagebox.showinfo("Busy", "Already running a workflow.")
+            return
+
+        # Pull current (possibly user-edited) param values back out of the widgets.
+        steps = []
+        for step, entries in self.copilot_step_widgets:
+            params = {k: e.get().strip() for k, e in entries.items()}
+            # preserve booleans that were rendered as text (true/false/1/0)
+            for k, v in list(params.items()):
+                if v.lower() in ("true", "false"):
+                    params[k] = v.lower() == "true"
+            steps.append({"type": step["type"], "label": step["label"], "params": params})
+
+        provider = self._copilot_provider
+        api_key = self.cop_api_key_entry.get().strip()
+        model_name = self.cop_model_combo.get().strip()
+        if not api_key:
+            messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
+            return
+
+        self.cop_run_btn.configure(state="disabled", text="Running...")
+        self.cop_plan_btn.configure(state="disabled")
+        self.cop_status_label.configure(text="Running workflow...", text_color="gray")
+        self.cop_log_box.delete("1.0", "end")
+
+        self.copilot_thread = threading.Thread(
+            target=self._run_cop_workflow_job, args=(steps, provider, api_key, model_name), daemon=True)
+        self.copilot_thread.start()
+
+    def _run_cop_workflow_job(self, steps, provider, api_key, model_name):
+        results, error_index = cp.run_workflow(steps, provider, api_key, model_name, self._cop_log)
+        self.copilot_queue.put(("run_done", (results, error_index)))
+
+    def _poll_copilot_queue(self):
+        try:
+            while True:
+                kind, payload = self.copilot_queue.get_nowait()
+                if kind == "log":
+                    self.cop_log_box.insert("end", payload + "\n")
+                    self.cop_log_box.see("end")
+                elif kind == "plan_done":
+                    self._render_plan(payload)
+                    self.cop_plan_btn.configure(state="normal", text="Plan Workflow")
+                    self.cop_status_label.configure(text="Plan ready — review below, then Run", text_color="#3ca34d")
+                elif kind == "plan_error":
+                    self.cop_plan_btn.configure(state="normal", text="Plan Workflow")
+                    self.cop_status_label.configure(text=payload, text_color="#e05050")
+                elif kind == "run_done":
+                    results, error_index = payload
+                    self.cop_run_btn.configure(state="normal", text="Run Workflow")
+                    self.cop_plan_btn.configure(state="normal")
+                    if error_index is None:
+                        self.cop_status_label.configure(text="Workflow completed", text_color="#3ca34d")
+                    else:
+                        self.cop_status_label.configure(
+                            text=f"Stopped at step {error_index + 1} — see log", text_color="#e05050")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_copilot_queue)
+
+    # ==================================================================
     # PAGE: Link Downloader
     # ==================================================================
     def _build_downloader_page(self, parent):
@@ -207,7 +570,7 @@ class App(ctk.CTk):
             "Scan an Excel sheet for links and download images/videos/audio in parallel")
 
         # File section
-        file_frame = ctk.CTkFrame(body, corner_radius=12)
+        file_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         file_frame.pack(fill="x", pady=10)
 
         self.excel_path = self._path_row(file_frame, "Excel file", self._browse_excel)
@@ -219,7 +582,7 @@ class App(ctk.CTk):
         self.folder_path.insert(0, r"C:\Users\Harsh\Downloads\HarvestedFiles")
 
         # Row / column range section
-        range_frame = ctk.CTkFrame(body, corner_radius=12)
+        range_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         range_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(range_frame, text="Rows & Columns to scan",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -247,7 +610,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=11), text_color="gray").pack(side="left", padx=6)
 
         # Advanced section
-        adv_frame = ctk.CTkFrame(body, corner_radius=12)
+        adv_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         adv_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(adv_frame, text="Advanced (optional)",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -429,7 +792,7 @@ class App(ctk.CTk):
             "Describe what to pull from a folder of PDFs — accurate, multithreaded, your choice of AI engine")
 
         # --- Configuration: AI provider + API key ---
-        cfg_frame = ctk.CTkFrame(body, corner_radius=12)
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         cfg_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(cfg_frame, text="Configuration",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -491,7 +854,7 @@ class App(ctk.CTk):
         self._refresh_provider_availability_warning()
 
         # --- Step 1: target + source ---
-        step1_frame = ctk.CTkFrame(body, corner_radius=12)
+        step1_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         step1_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(step1_frame, text="Step 1: Define Target & Source",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -506,7 +869,7 @@ class App(ctk.CTk):
         self.pdf_source_folder = self._path_row(step1_frame, "Source Folder", self._browse_pdf_source)
 
         # --- Step 2: output ---
-        step2_frame = ctk.CTkFrame(body, corner_radius=12)
+        step2_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         step2_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(step2_frame, text="Step 2: Output Destination",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -515,7 +878,7 @@ class App(ctk.CTk):
         self.pdf_sheet_name = self._entry_row(step2_frame, "Sheet Name", "extracted_results")
 
         # --- Advanced: thread slider ---
-        pdf_adv_frame = ctk.CTkFrame(body, corner_radius=12)
+        pdf_adv_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         pdf_adv_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(pdf_adv_frame, text="Advanced (optional)",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -751,7 +1114,7 @@ class App(ctk.CTk):
         self.profiler_chart_canvas_widget = None
 
         # --- Load data ---
-        load_frame = ctk.CTkFrame(body, corner_radius=12)
+        load_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         load_frame.pack(fill="x", pady=10)
         self.profiler_input_path = self._path_row(load_frame, "Data file", self._browse_profiler_input)
 
@@ -765,7 +1128,7 @@ class App(ctk.CTk):
         self.profiler_status_label.pack(side="left", padx=12)
 
         # --- KPI cards ---
-        kpi_frame = ctk.CTkFrame(body, corner_radius=12)
+        kpi_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         kpi_frame.pack(fill="x", pady=10)
         kpi_row = ctk.CTkFrame(kpi_frame, fg_color="transparent")
         kpi_row.pack(fill="x", padx=16, pady=16)
@@ -791,7 +1154,7 @@ class App(ctk.CTk):
         split_frame.grid_columnconfigure(1, weight=1)
         split_frame.grid_rowconfigure(0, weight=1)
 
-        filters_frame = ctk.CTkFrame(split_frame, corner_radius=12)
+        filters_frame = ctk.CTkFrame(split_frame, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         filters_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         ctk.CTkLabel(filters_frame, text="Anomalies to fix", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 8), padx=16, anchor="w")
@@ -826,7 +1189,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=10), text_color="gray", wraplength=280,
                      justify="left").pack(anchor="w", padx=16, pady=(8, 16))
 
-        chart_frame = ctk.CTkFrame(split_frame, corner_radius=12)
+        chart_frame = ctk.CTkFrame(split_frame, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         chart_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         ctk.CTkLabel(chart_frame, text="Anomaly Breakdown", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 8))
@@ -836,7 +1199,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=12), text_color="gray").pack(expand=True)
 
         # --- Export ---
-        export_frame = ctk.CTkFrame(body, corner_radius=12)
+        export_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         export_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(export_frame, text="Export Cleaned Data", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6))
@@ -957,10 +1320,13 @@ class App(ctk.CTk):
     def _build_sheet_editor_page(self, parent):
         page, body = self._new_page(
             parent, "Excel Editor",
-            "Load a spreadsheet, describe an edit in plain English, and apply it — undo, redo, and save when you're happy")
+            "Load a spreadsheet, describe an edit in plain English, and apply it — "
+            "undo, redo, and save when you're happy. Simple edits use a safe built-in "
+            "toolkit; anything more complex (grouping, pivots, multi-step logic) is "
+            "handled with generated Python/pandas, run in a locked-down sandbox")
 
         # --- Load file ---
-        load_frame = ctk.CTkFrame(body, corner_radius=12)
+        load_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         load_frame.pack(fill="x", pady=10)
         self.editor_input_path = self._path_row(load_frame, "Spreadsheet", self._browse_editor_input)
 
@@ -980,7 +1346,7 @@ class App(ctk.CTk):
         self.editor_load_status.pack(anchor="w", padx=16, pady=(0, 14))
 
         # --- AI configuration (reuses the same provider/key setup as PDF Extractor) ---
-        cfg_frame = ctk.CTkFrame(body, corner_radius=12)
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         cfg_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(cfg_frame, text="AI Engine (used to turn your instruction into edits)",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -1028,13 +1394,16 @@ class App(ctk.CTk):
         self._refresh_editor_provider_warning()
 
         # --- Prompt ---
-        prompt_frame = ctk.CTkFrame(body, corner_radius=12)
+        prompt_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         prompt_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(prompt_frame, text="Describe the edit", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6))
         ctk.CTkLabel(prompt_frame,
-                     text="e.g. \"Remove rows where Status is Cancelled, then sort by Date descending\"",
-                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16)
+                     text="e.g. \"Remove rows where Status is Cancelled, then sort by Date descending\" "
+                          "or \"Group by region and sum Sales\" or \"Pivot Month vs Product with Sales as values\" — "
+                          "simple edits and SQL/pivot-style requests are both supported",
+                     font=ctk.CTkFont(size=11), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16)
         self.editor_prompt = ctk.CTkTextbox(prompt_frame, height=70, corner_radius=8)
         self.editor_prompt.pack(fill="x", padx=16, pady=(4, 6))
 
@@ -1049,7 +1418,7 @@ class App(ctk.CTk):
         self.editor_apply_status.pack(side="left", padx=12)
 
         # --- Undo / redo / save toolbar ---
-        toolbar_frame = ctk.CTkFrame(body, corner_radius=12)
+        toolbar_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         toolbar_frame.pack(fill="x", pady=10)
         toolbar_line = ctk.CTkFrame(toolbar_frame, fg_color="transparent")
         toolbar_line.pack(fill="x", padx=16, pady=12)
@@ -1069,7 +1438,7 @@ class App(ctk.CTk):
         self.editor_saveas_btn.pack(side="left")
 
         # --- Table preview ---
-        table_frame = ctk.CTkFrame(body, corner_radius=12)
+        table_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         table_frame.pack(fill="both", expand=True, pady=10)
         ctk.CTkLabel(table_frame, text="Sheet Preview", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 4), anchor="w", padx=16)
@@ -1094,7 +1463,7 @@ class App(ctk.CTk):
         tree_host.grid_columnconfigure(0, weight=1)
 
         # --- Edit log ---
-        log_frame = ctk.CTkFrame(body, corner_radius=12)
+        log_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         log_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(log_frame, text="Edit Log", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6), anchor="w", padx=16)
@@ -1382,7 +1751,7 @@ class App(ctk.CTk):
             "column, a live preview, an editable Excel dashboard, and a plain-English summary")
 
         # --- Load data ---
-        load_frame = ctk.CTkFrame(body, corner_radius=12)
+        load_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         load_frame.pack(fill="x", pady=10)
         self.dash_input_path = self._path_row(load_frame, "Data file", self._browse_dash_input)
         analyze_line = ctk.CTkFrame(load_frame, fg_color="transparent")
@@ -1395,7 +1764,7 @@ class App(ctk.CTk):
         self.dash_status_label.pack(side="left", padx=12)
 
         # --- AI configuration (reuses the same provider/key already saved for PDF Extractor) ---
-        cfg_frame = ctk.CTkFrame(body, corner_radius=12)
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         cfg_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(cfg_frame, text="AI Engine (writes the plain-English summary — optional)",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
@@ -1445,8 +1814,30 @@ class App(ctk.CTk):
         self.dash_provider_warning.pack(anchor="w", padx=16, pady=(0, 10))
         self._refresh_dash_provider_warning()
 
+        # --- Reference (optional): steer the AI's chart-plan reasoning ---
+        ref_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
+        ref_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(ref_frame, text="Reference (optional)",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), anchor="w", padx=16)
+        ctk.CTkLabel(ref_frame,
+                     text="Not required — leave blank and a sensible dashboard is built "
+                          "automatically. Describe the kind of dashboard/insight you want, "
+                          "and/or attach a reference file (e.g. a sample dashboard or brief) "
+                          "to steer emphasis.",
+                     font=ctk.CTkFont(size=11), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+        self.dash_reference_text = ctk.CTkTextbox(ref_frame, height=60, corner_radius=8)
+        self.dash_reference_text.pack(fill="x", padx=16, pady=(0, 8))
+        ref_file_row = ctk.CTkFrame(ref_frame, fg_color="transparent")
+        ref_file_row.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkLabel(ref_file_row, text="Reference file", width=110, anchor="w").pack(side="left")
+        self.dash_reference_file = ctk.CTkEntry(ref_file_row)
+        self.dash_reference_file.pack(side="left", fill="x", expand=True, padx=6)
+        ctk.CTkButton(ref_file_row, text="Browse", width=80,
+                      command=self._browse_dash_reference).pack(side="left")
+
         # --- Column classification ---
-        classify_frame = ctk.CTkFrame(body, corner_radius=12)
+        classify_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         classify_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(classify_frame, text="Column Classification", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6), anchor="w", padx=16)
@@ -1456,7 +1847,7 @@ class App(ctk.CTk):
         self.dash_columns_box.configure(state="disabled")
 
         # --- Chart plan + preview ---
-        plan_frame = ctk.CTkFrame(body, corner_radius=12)
+        plan_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         plan_frame.pack(fill="both", expand=True, pady=10)
         ctk.CTkLabel(plan_frame, text="Suggested Charts", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6), anchor="w", padx=16)
@@ -1471,7 +1862,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=12), text_color="gray").pack(expand=True)
 
         # --- Summary ---
-        summary_frame = ctk.CTkFrame(body, corner_radius=12)
+        summary_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         summary_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(summary_frame, text="Dashboard Logic — Summary", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6), anchor="w", padx=16)
@@ -1479,14 +1870,25 @@ class App(ctk.CTk):
         self.dash_summary_box.pack(fill="x", padx=16, pady=(0, 14))
 
         # --- Export ---
-        export_frame = ctk.CTkFrame(body, corner_radius=12)
+        export_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         export_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(export_frame, text="Export", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6))
         self.dash_export_btn = ctk.CTkButton(export_frame, text="Export Dashboard Excel", height=44,
                                               font=ctk.CTkFont(size=15, weight="bold"),
                                               command=self._export_dashboard_excel, state="disabled")
-        self.dash_export_btn.pack(pady=(0, 16), padx=16, fill="x")
+        self.dash_export_btn.pack(pady=(0, 8), padx=16, fill="x")
+        self.dash_powerbi_btn = ctk.CTkButton(
+            export_frame, text="Export for Power BI", height=40,
+            fg_color="transparent", border_width=1, text_color=("gray20", "gray85"),
+            command=self._export_dashboard_powerbi, state="disabled")
+        self.dash_powerbi_btn.pack(pady=(0, 6), padx=16, fill="x")
+        ctk.CTkLabel(export_frame,
+                     text="Writes a proper Excel Table that Power BI's Get Data > Excel Workbook "
+                          "reads directly, plus a short one-page import guide. (LinkHarvest can't "
+                          "generate a .pbix file itself — only Power BI Desktop writes that format.)",
+                     font=ctk.CTkFont(size=10), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 16))
 
         return page
 
@@ -1495,6 +1897,13 @@ class App(ctk.CTk):
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
+
+    def _browse_dash_reference(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Reference files", "*.txt *.md *.csv *.xlsx *.xls"), ("All files", "*.*")])
+        if path:
+            self.dash_reference_file.delete(0, "end")
+            self.dash_reference_file.insert(0, path)
 
     def _on_dash_provider_change(self, selection):
         self._dash_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
@@ -1546,6 +1955,8 @@ class App(ctk.CTk):
         provider = self._dash_provider
         api_key = self.dash_api_key_entry.get().strip()
         model_name = self.dash_model_combo.get().strip()
+        reference_text = self.dash_reference_text.get("1.0", "end").strip()
+        reference_file = self.dash_reference_file.get().strip()
 
         if want_summary and not api_key:
             proceed = messagebox.askyesno(
@@ -1562,11 +1973,12 @@ class App(ctk.CTk):
 
         self.dashboard_thread = threading.Thread(
             target=self._run_dashboard_job,
-            args=(filepath, want_summary, provider, api_key, model_name),
+            args=(filepath, want_summary, provider, api_key, model_name, reference_text, reference_file),
             daemon=True)
         self.dashboard_thread.start()
 
-    def _run_dashboard_job(self, filepath, want_summary, provider, api_key, model_name):
+    def _run_dashboard_job(self, filepath, want_summary, provider, api_key, model_name,
+                            reference_text="", reference_file=""):
         try:
             df = dp.load_data(filepath)
         except ValueError as e:
@@ -1575,12 +1987,21 @@ class App(ctk.CTk):
 
         column_info = db.classify_columns(df)
         plan = db.suggest_chart_plan(df, column_info)
+        aggregates = db.compute_group_aggregates(df, column_info)
+
+        combined_reference = reference_text
+        if reference_file:
+            file_text = db.read_reference_text(reference_file)
+            if file_text:
+                combined_reference = f"{combined_reference}\n\n{file_text}".strip()
 
         summary = ""
         summary_error = None
         if want_summary:
             try:
-                summary = db.generate_ai_summary(column_info, plan, provider, api_key, model_name=model_name)
+                summary = db.generate_ai_summary(
+                    column_info, plan, provider, api_key, model_name=model_name,
+                    aggregates=aggregates, reference_text=combined_reference or None)
             except db.AuthError as e:
                 summary_error = f"Authentication failed, summary skipped: {e}"
             except Exception as e:
@@ -1638,6 +2059,7 @@ class App(ctk.CTk):
             text=f"{len(df)} rows, {len(df.columns)} columns — {len(plan)} chart(s) suggested.",
             text_color="gray")
         self.dash_export_btn.configure(state="normal")
+        self.dash_powerbi_btn.configure(state="normal")
 
     def _set_textbox(self, box, text):
         box.configure(state="normal")
@@ -1669,17 +2091,45 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def _export_dashboard_powerbi(self):
+        if self.dashboard_df is None:
+            messagebox.showerror("Nothing to export", "Please build a dashboard plan first.")
+            return
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")],
+            initialfile="LinkHarvest_PowerBI_Data.xlsx")
+        if not save_path:
+            return
+        try:
+            db.export_power_bi_ready(self.dashboard_df, save_path)
+        except Exception as e:
+            messagebox.showerror("Couldn't save Power BI file", str(e))
+            return
+        messagebox.showinfo(
+            "Power BI file exported",
+            f"Saved to:\n{save_path}\n\n"
+            "In Power BI Desktop: Get Data > Excel Workbook > select the "
+            "'DashboardData' table (see the 'Import to Power BI' sheet for details).")
+        try:
+            folder = os.path.dirname(os.path.abspath(save_path))
+            if os.name == "nt":
+                os.startfile(folder)
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
+
     # ==================================================================
     # PAGE: AI Assistant
     # ==================================================================
     def _build_ai_assistant_page(self, parent):
         page, body = self._new_page(
             parent, "AI Assistant",
-            "Attach up to 3 images (a table, schema, error, sketch — anything visual) and "
-            "describe what to write — SQL, DAX, Python, an Excel formula, VBA, and more")
+            "Attach up to 3 images and/or an Excel/CSV file, then describe what to write — "
+            "SQL, DAX, Python, an Excel formula, VBA, and more")
 
         # --- AI configuration (reuses the same provider/key already saved for PDF Extractor) ---
-        cfg_frame = ctk.CTkFrame(body, corner_radius=12)
+        cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         cfg_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(cfg_frame, text="AI Engine", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6))
@@ -1730,7 +2180,7 @@ class App(ctk.CTk):
         self._refresh_asst_provider_warning()
 
         # --- Image attachments ---
-        img_frame = ctk.CTkFrame(body, corner_radius=12)
+        img_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         img_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(img_frame, text="Attach Images (up to 3, optional)",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), anchor="w", padx=16)
@@ -1748,10 +2198,28 @@ class App(ctk.CTk):
                           text_color=("gray20", "gray85"),
                           command=lambda e=entry: e.delete(0, "end")).pack(side="left")
             self.assistant_image_entries.append(entry)
+
+        ctk.CTkFrame(img_frame, height=1, fg_color=("gray80", "gray30")).pack(fill="x", padx=16, pady=(8, 8))
+        ctk.CTkLabel(img_frame, text="Attach a Spreadsheet (optional — .xlsx, .xls, .csv)",
+                     font=ctk.CTkFont(weight="bold", size=13)).pack(anchor="w", padx=16, pady=(0, 6))
+        sheet_row = ctk.CTkFrame(img_frame, fg_color="transparent")
+        sheet_row.pack(fill="x", padx=16, pady=(0, 4))
+        self.asst_sheet_entry = ctk.CTkEntry(sheet_row)
+        self.asst_sheet_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(sheet_row, text="Browse", width=80,
+                      command=self._browse_asst_sheet).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(sheet_row, text="Clear", width=60, fg_color="transparent", border_width=1,
+                      text_color=("gray20", "gray85"),
+                      command=lambda: self.asst_sheet_entry.delete(0, "end")).pack(side="left")
+        ctk.CTkLabel(img_frame,
+                     text="Real column names, types, and a small sample of rows are read from this "
+                          "file and given to the AI as ground truth alongside any images.",
+                     font=ctk.CTkFont(size=10), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16, pady=(4, 0))
         ctk.CTkLabel(img_frame, text="", height=6).pack()
 
         # --- Prompt ---
-        prompt_frame = ctk.CTkFrame(body, corner_radius=12)
+        prompt_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         prompt_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(prompt_frame, text="What should it write?", font=ctk.CTkFont(weight="bold", size=14)
                      ).pack(pady=(12, 6))
@@ -1771,7 +2239,7 @@ class App(ctk.CTk):
         self.asst_status_label.pack(side="left", padx=12)
 
         # --- Output ---
-        out_frame = ctk.CTkFrame(body, corner_radius=12)
+        out_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         out_frame.pack(fill="both", expand=True, pady=10)
         out_header = ctk.CTkFrame(out_frame, fg_color="transparent")
         out_header.pack(fill="x", padx=16, pady=(12, 6))
@@ -1789,6 +2257,12 @@ class App(ctk.CTk):
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
+
+    def _browse_asst_sheet(self):
+        path = filedialog.askopenfilename(filetypes=[("Spreadsheet files", "*.xlsx *.xls *.csv")])
+        if path:
+            self.asst_sheet_entry.delete(0, "end")
+            self.asst_sheet_entry.insert(0, path)
 
     def _on_asst_provider_change(self, selection):
         self._asst_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
@@ -1843,6 +2317,7 @@ class App(ctk.CTk):
         model_name = self.asst_model_combo.get().strip()
         prompt = self.asst_prompt.get("1.0", "end").strip()
         image_paths = [e.get().strip() for e in self.assistant_image_entries if e.get().strip()]
+        sheet_path = self.asst_sheet_entry.get().strip()
 
         if not api_key:
             messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
@@ -1857,19 +2332,24 @@ class App(ctk.CTk):
                                   "None of the attached paths are readable image files "
                                   "(png/jpg/jpeg/webp/gif/bmp).")
             return
+        if sheet_path and not aa.validate_spreadsheet(sheet_path):
+            messagebox.showerror("Invalid spreadsheet",
+                                  "The attached file isn't a readable .xlsx/.xls/.csv.")
+            return
 
         self.asst_ask_btn.configure(state="disabled", text="Thinking...")
-        self.asst_status_label.configure(text="Reading images and writing a response...", text_color="gray")
+        self.asst_status_label.configure(text="Reading attachments and writing a response...", text_color="gray")
 
         self.assistant_thread = threading.Thread(
             target=self._run_asst_job,
-            args=(prompt, images, provider, api_key, model_name),
+            args=(prompt, images, provider, api_key, model_name, sheet_path),
             daemon=True)
         self.assistant_thread.start()
 
-    def _run_asst_job(self, prompt, images, provider, api_key, model_name):
+    def _run_asst_job(self, prompt, images, provider, api_key, model_name, sheet_path=None):
         try:
-            response = aa.ask_assistant(prompt, images, provider, api_key, model_name=model_name)
+            response = aa.ask_assistant(prompt, images, provider, api_key,
+                                         model_name=model_name, spreadsheet_path=sheet_path)
         except aa.AuthError as e:
             self.assistant_queue.put(("error", f"Authentication failed: {e}"))
             return
@@ -1911,7 +2391,7 @@ class App(ctk.CTk):
             parent, "Support Development",
             "LinkHarvest is free — this is just an optional way to say thanks")
 
-        donate_frame = ctk.CTkFrame(body, corner_radius=12)
+        donate_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         donate_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(donate_frame, text="❤ Leave a UPI donation",
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(16, 4))
@@ -1935,12 +2415,23 @@ class App(ctk.CTk):
             self.qr_label.configure(text="(Donation QR unavailable)")
 
     # ==================================================================
-    # Update checker (applies to the whole app, shown once on startup)
+    # Update checker (advisory — runs after the app is already usable,
+    # since a pending update isn't a security gate the way authorization
+    # is). Authorization itself is checked BEFORE the interactive app is
+    # ever built — see _authorize_then_launch() near __init__ — so a
+    # blocked/retired version never becomes usable even momentarily.
     # ==================================================================
     def _check_update_background(self):
         info = check_for_update(__version__)
         if info:
             self.after(0, lambda: self._show_update_prompt(info))
+
+    def _show_authorization_block(self, block_message):
+        messagebox.showerror(
+            "LinkHarvest",
+            block_message or "This version of LinkHarvest is no longer available. "
+                              "Please download the latest version.")
+        self.destroy()
 
     def _show_update_prompt(self, info):
         target_url = info.get("download_url") or info["url"]
@@ -1983,17 +2474,17 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
-    allowed, block_message = check_authorization(__version__)
-    if not allowed:
-        import tkinter as tk
-        from tkinter import messagebox as _mb
-        _root = tk.Tk()
-        _root.withdraw()  # no blank window behind the popup
-        _mb.showerror("LinkHarvest",
-                       block_message or "This version of LinkHarvest is no longer available. "
-                                        "Please download the latest version.")
-        _root.destroy()
-        raise SystemExit(0)
+    # Required for multiprocessing (used by sheet_editor's sandboxed,
+    # timeout-bounded Python transform) to work correctly once this app is
+    # packaged as a Windows .exe with PyInstaller — without this, a frozen
+    # build can re-launch the whole app in the child process instead of
+    # just running the worker function. Must be the very first thing here.
+    multiprocessing.freeze_support()
 
+    # A lightweight, non-interactive splash appears instantly; the real
+    # interactive app is only built after the authorization check clears
+    # in the background (see App._authorize_then_launch / _finish_launch).
+    # This keeps launch feeling instant without ever exposing a blocked
+    # version's functionality before the check completes.
     app = App()
     app.mainloop()

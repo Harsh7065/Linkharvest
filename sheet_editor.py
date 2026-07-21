@@ -5,21 +5,33 @@ Backend logic for the "Excel Editor" sidebar page in LinkHarvest.
 Lets the user load a spreadsheet, describe an edit in plain English, and
 have it applied to the data — with undo/redo and save.
 
-Design choice: the AI is NEVER asked to write or execute arbitrary code.
-Instead it translates the instruction into a small JSON list of operations
-drawn from a fixed, safe vocabulary (rename column, filter rows, sort,
-add a computed column, fill missing values, etc). Each operation is then
-applied by our own deterministic pandas code in apply_operation(). This
-keeps every edit predictable, undoable, and impossible to turn into
-something destructive outside the spreadsheet itself.
+Design: most instructions are translated into a small JSON list of
+operations drawn from a fixed, safe vocabulary (rename column, filter
+rows, sort, add a computed column, fill missing values, etc). Each
+operation is then applied by our own deterministic pandas code in
+apply_operation(). This keeps common edits predictable and undoable.
+
+For anything the fixed vocabulary can't express — a SQL-style GROUP BY,
+a pivot, a multi-column formula, a regex cleanup, a VBA-style loop
+translated into pandas, or anything else the user describes — the model
+can instead emit a single `run_python_transform` operation containing a
+pandas snippet. That snippet is executed through _run_python_transform()
+in a locked-down sandbox: no builtins beyond a tiny safe subset, no
+`import`, no file/network/OS access, only `pd`, `np`, and the sheet
+itself (as `df`) are in scope, and the result must be a DataFrame. This
+keeps the "use SQL/Python/VBA/anything" flexibility the user wants while
+never letting generated code touch anything outside the loaded sheet.
 
 No UI code lives here. Keep this importable and testable on its own.
 """
 import os
 import json
 import time
+import ast
+import multiprocessing as mp
 
 import pandas as pd
+import numpy as np
 
 import pdf_extractor as pe  # reuse provider constants + saved .env API keys
 
@@ -330,7 +342,129 @@ def apply_operation(df: pd.DataFrame, op: dict) -> pd.DataFrame:
         remaining = [c for c in df.columns if c not in order]
         return df[order + remaining]
 
+    if kind == "run_python_transform":
+        code = op.get("code", "")
+        if not isinstance(code, str) or not code.strip():
+            raise OperationError("run_python_transform needs a non-empty 'code' string.")
+        return _run_python_transform(df, code)
+
     raise OperationError(f"Unsupported operation '{kind}'.")
+
+
+# --------------------------------------------------------------------------
+# Sandboxed fallback: lets the AI express edits the fixed vocabulary can't
+# (group-by/pivot logic, regex, multi-column formulas, SQL/VBA translated
+# into pandas, etc) without giving it real code-execution privileges.
+# --------------------------------------------------------------------------
+import builtins as _builtins_module
+
+_SAFE_BUILTINS = {
+    name: getattr(_builtins_module, name)
+    for name in ("abs", "all", "any", "bool", "dict", "enumerate", "float", "int",
+                 "len", "list", "max", "min", "range", "round", "set", "sorted",
+                 "str", "sum", "tuple", "zip")
+    if hasattr(_builtins_module, name)
+}
+
+
+# --------------------------------------------------------------------------
+# AST-based validation — blocks the *technique* (dunder attribute-chain
+# escapes, import statements, calls to dangerous names), not specific
+# words. A word blacklist can be beaten by anyone who knows Python well
+# enough to write around it (e.g. string concatenation to build "os", or
+# reaching the same objects via ().__class__.__base__.__subclasses__()
+# without ever writing "import" or "os"); this walks the actual parse
+# tree so the technique itself is rejected regardless of spelling.
+# --------------------------------------------------------------------------
+_BANNED_NAMES = {
+    "open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
+    "getattr", "setattr", "delattr", "hasattr", "input", "breakpoint", "help",
+    "exit", "quit", "memoryview", "os", "sys", "subprocess", "socket", "shutil",
+    "pathlib", "importlib", "ctypes", "pickle", "marshal", "builtins", "__builtins__",
+}
+_BANNED_AST_NODE_TYPES = (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal,
+                           ast.Delete, ast.With, ast.AsyncWith)
+
+
+def _validate_transform_code(code: str) -> None:
+    """Raises OperationError if `code` uses any disallowed construct."""
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as e:
+        raise OperationError(f"Generated code has a syntax error: {e}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, _BANNED_AST_NODE_TYPES):
+            raise OperationError(
+                f"Generated code was rejected for safety "
+                f"('{type(node).__name__}' statements aren't allowed).")
+        # Blocks the standard sandbox-escape technique: reaching restricted
+        # objects via dunder attribute chains (__class__, __globals__,
+        # __subclasses__, __mro__, __base__, etc.) — this is what actually
+        # stops the attack a keyword filter can't see.
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            raise OperationError(
+                f"Generated code was rejected for safety (access to '{node.attr}' isn't allowed).")
+        if isinstance(node, ast.Name) and node.id in _BANNED_NAMES:
+            raise OperationError(
+                f"Generated code was rejected for safety (use of '{node.id}' isn't allowed).")
+
+
+# Runs in a separate process (see _run_python_transform) — must be a
+# top-level, picklable function for multiprocessing's spawn start method.
+def _sandbox_worker(code: str, df: pd.DataFrame, result_queue):
+    try:
+        sandbox_globals = {"__builtins__": _SAFE_BUILTINS, "pd": pd, "np": np}
+        sandbox_locals = {"df": df}
+        exec(code, sandbox_globals, sandbox_locals)  # noqa: S102 - AST-validated + sandboxed above
+        result = sandbox_locals.get("df")
+        if not isinstance(result, pd.DataFrame):
+            result_queue.put(("error", "Generated code didn't leave a DataFrame in `df`."))
+        else:
+            result_queue.put(("ok", result))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+TRANSFORM_TIMEOUT_SECONDS = 10
+
+
+def _run_python_transform(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """
+    Executes a short pandas snippet against a copy of df in a locked-down
+    namespace (no `import`, no builtins beyond a small safe subset, no
+    filesystem/network/process access) AND in a separate process with a
+    hard wall-clock timeout, so a generated snippet that hangs (an
+    accidental infinite loop, not just a malicious one) can never freeze
+    the app — it gets killed and reported as a failure instead.
+
+    Requires multiprocessing.freeze_support() to have been called at the
+    top of the app's `if __name__ == "__main__":` block (see app.py) so
+    this works correctly in a PyInstaller-frozen .exe on Windows.
+    """
+    _validate_transform_code(code)
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_sandbox_worker, args=(code, df.copy(), result_queue), daemon=True)
+    proc.start()
+    proc.join(TRANSFORM_TIMEOUT_SECONDS)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        raise OperationError(
+            f"Generated code took longer than {TRANSFORM_TIMEOUT_SECONDS}s and was stopped.")
+
+    try:
+        status, payload = result_queue.get_nowait()
+    except Exception:
+        raise OperationError(
+            f"Generated code exited unexpectedly (exit code {proc.exitcode}) without a result.")
+
+    if status == "error":
+        raise OperationError(f"Generated Python code failed: {payload}")
+    return payload
 
 
 def apply_operations(df: pd.DataFrame, ops: list) -> pd.DataFrame:
@@ -369,11 +503,19 @@ def _build_system_prompt() -> str:
         "- round_numbers: {\"column\", \"decimals\" (int)}\n"
         "- change_dtype: {\"column\", \"dtype\" (number,text,date)}\n"
         "- reorder_columns: {\"columns\" (list, in the desired order; remaining columns keep "
-        "their existing order after them)}\n\n"
+        "their existing order after them)}\n"
+        "- run_python_transform: {\"code\"} — a fallback for anything the operations above can't "
+        "express: a GROUP BY / pivot-style aggregation, a multi-column formula, a regex cleanup, "
+        "a VBA-style loop, or SQL-like logic — all translated into pandas. `code` is a short Python "
+        "snippet that reads the DataFrame from a variable named `df` and must reassign the final "
+        "result back to `df` (e.g. \"df = df.groupby('region', as_index=False)['sales'].sum()\"). "
+        "Only `pd` (pandas) and `np` (numpy) are available — no imports, no file/network/OS access. "
+        "Prefer the named operations above whenever they can do the job; use run_python_transform "
+        "only when they genuinely can't.\n\n"
         "Rules:\n"
         "1. Only reference column names that actually appear in the provided profile — never invent one.\n"
-        "2. If the instruction is ambiguous, impossible with these operations, or needs a column "
-        "that doesn't exist, return {\"operations\": [], \"explanation\": \"<why you couldn't do it>\"}.\n"
+        "2. If the instruction is ambiguous, impossible even with run_python_transform, or needs a "
+        "column that doesn't exist, return {\"operations\": [], \"explanation\": \"<why you couldn't do it>\"}.\n"
         "3. Use the smallest number of operations that satisfies the instruction.\n"
         "4. Return ONLY the JSON object — no markdown, no commentary outside the JSON."
     )
