@@ -208,6 +208,48 @@ def suggest_chart_plan(df: pd.DataFrame, column_info: list = None) -> list:
 
 
 # ==========================================================================
+# 2b. SQL/DAX-style aggregates — real computed numbers, not just chart
+# metadata, so the AI summary/plan reasoning is grounded in the actual data
+# (equivalent to a GROUP BY ... SUM/AVG/COUNT, or a DAX measure).
+# ==========================================================================
+def compute_group_aggregates(df: pd.DataFrame, column_info: list = None, top_n: int = 5) -> list:
+    """
+    For each categorical column paired with each numeric column, computes
+    the pandas equivalent of:
+        SELECT category, SUM(value), AVG(value), COUNT(*)
+        FROM df GROUP BY category ORDER BY SUM(value) DESC LIMIT top_n
+    Returns a list of {"category_column", "value_column", "top_groups": [...]}
+    dicts, capped to keep the payload sent to the AI small.
+    """
+    column_info = column_info if column_info is not None else classify_columns(df)
+    categoricals = [c["column"] for c in column_info if c["kind"] == "categorical"]
+    numerics = [c["column"] for c in column_info if c["kind"] == "numeric"]
+
+    aggregates = []
+    for cat in categoricals[:3]:
+        for num in numerics[:2]:
+            try:
+                grouped = (
+                    df.groupby(cat)[num]
+                    .agg(sum="sum", avg="mean", count="count")
+                    .sort_values("sum", ascending=False)
+                    .head(top_n)
+                )
+            except Exception:
+                continue
+            aggregates.append({
+                "category_column": cat,
+                "value_column": num,
+                "top_groups": [
+                    {"group": str(idx), "sum": round(float(row["sum"]), 2),
+                     "avg": round(float(row["avg"]), 2), "count": int(row["count"])}
+                    for idx, row in grouped.iterrows()
+                ],
+            })
+    return aggregates
+
+
+# ==========================================================================
 # 3. On-screen preview (matplotlib grid, embedded via FigureCanvasTkAgg)
 # ==========================================================================
 _BG = "#1F1F1F"
@@ -340,6 +382,78 @@ def build_excel_dashboard(df: pd.DataFrame, plan: list, output_path: str, summar
     return output_path
 
 
+def read_reference_text(reference_path: str, max_chars: int = 4000) -> str:
+    """
+    Reads an optional user-supplied 'reference' file describing the kind of
+    dashboard they want. Plain text/markdown files are read as-is; a
+    CSV/Excel reference is summarized (columns + a few rows) rather than
+    dumped whole. Returns "" if the file can't be read — this is always
+    optional, so a read failure should never block dashboard generation.
+    """
+    if not reference_path or not os.path.isfile(reference_path):
+        return ""
+    ext = os.path.splitext(reference_path)[1].lower()
+    try:
+        if ext in (".csv", ".xlsx", ".xls"):
+            df = pd.read_csv(reference_path) if ext == ".csv" else pd.read_excel(reference_path)
+            text = (f"Reference file columns: {', '.join(map(str, df.columns))}\n"
+                    f"Sample rows:\n{df.head(5).to_csv(index=False)}")
+        else:
+            with open(reference_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+# ==========================================================================
+# 4b. Power BI-ready export — a proper Excel Table (ListObject), which
+# Power BI's "Get Data > Excel Workbook" reads directly as a query-ready
+# table (unlike a plain, un-tabled data range). We can't generate an actual
+# .pbix file outside Power BI itself, so this is the standard hand-off
+# format plus a short sheet explaining the one-click import.
+# ==========================================================================
+def export_power_bi_ready(df: pd.DataFrame, output_path: str) -> str:
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    for row in dataframe_to_rows(df, index=False, header=True):
+        ws.append(row)
+
+    n_rows, n_cols = ws.max_row, ws.max_column
+    last_col_letter = ws.cell(row=1, column=n_cols).column_letter
+    table_ref = f"A1:{last_col_letter}{n_rows}"
+    table = Table(displayName="DashboardData", ref=table_ref)
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium9", showRowStripes=True, showFirstColumn=False)
+    ws.add_table(table)
+
+    howto = wb.create_sheet("Import to Power BI")
+    howto["A1"] = "Importing this workbook into Power BI"
+    howto["A1"].font = howto["A1"].font.copy(bold=True, size=14)
+    steps = [
+        "1. In Power BI Desktop: Home > Get Data > Excel Workbook.",
+        f"2. Select this file, then choose the 'DashboardData' table on the 'Data' sheet "
+        "(it's a real Excel Table, so Power BI reads it as a clean query-ready source).",
+        "3. Click Load (or Transform Data first if you want to reshape columns in Power Query).",
+        "4. Build visuals from the loaded table as usual.",
+        "",
+        "Note: LinkHarvest can't generate a .pbix file directly — Power BI Desktop only "
+        "writes that format itself — but this Table-based .xlsx is the standard, "
+        "zero-friction hand-off format Power BI expects.",
+    ]
+    for i, line in enumerate(steps, start=3):
+        cell = howto.cell(row=i, column=1, value=line)
+        cell.alignment = cell.alignment.copy(wrap_text=True)
+    howto.column_dimensions["A"].width = 100
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
 def _col_letter_index(headers, name):
     return headers.index(name) + 1  # openpyxl columns are 1-indexed
 
@@ -407,7 +521,7 @@ def _build_excel_chart(spec, data_ws, headers, max_row):
 # ==========================================================================
 # 5. Optional AI summary of the dashboard logic (reuses pe's provider infra)
 # ==========================================================================
-def _build_summary_prompt(column_info, plan) -> str:
+def _build_summary_prompt(column_info, plan, aggregates=None, reference_text=None) -> str:
     cols_desc = "\n".join(
         f"- {c['column']}: {c['kind']} ({c['unique_count']} unique values, {c['missing']} missing)"
         for c in column_info
@@ -415,16 +529,34 @@ def _build_summary_prompt(column_info, plan) -> str:
     charts_desc = "\n".join(
         f"- {p['title']} ({p['chart_type']}): {p['reason']}" for p in plan
     )
+    agg_desc = ""
+    if aggregates:
+        lines = []
+        for a in aggregates:
+            top = ", ".join(f"{g['group']}={g['sum']}" for g in a["top_groups"][:3])
+            lines.append(f"- SUM({a['value_column']}) GROUP BY {a['category_column']}: {top}")
+        agg_desc = "\n\nActual computed aggregates (GROUP BY-style, use these real numbers):\n" + "\n".join(lines)
+
+    ref_desc = ""
+    if reference_text:
+        ref_desc = (
+            "\n\nThe user described the kind of dashboard/insight they want (use this to shape "
+            f"which points you emphasize, but stay grounded in the actual data above):\n{reference_text}"
+        )
+
     return (
         "You are a data analyst explaining a dashboard's structure to someone who has "
         "never built one before. Given this column breakdown:\n"
         f"{cols_desc}\n\n"
         "And this proposed set of charts:\n"
-        f"{charts_desc}\n\n"
+        f"{charts_desc}"
+        f"{agg_desc}"
+        f"{ref_desc}\n\n"
         "Write a short, plain-English summary (5-9 sentences, no headings, no markdown) that: "
         "explains WHY this data was grouped into these particular chart types, what each chart "
-        "tells the reader at a glance, and one or two things to watch out for (e.g. skewed "
-        "categories, missing data) when interpreting it. Do not repeat the raw lists back verbatim."
+        "tells the reader at a glance (citing real numbers from the aggregates when available), "
+        "and one or two things to watch out for (e.g. skewed categories, missing data) when "
+        "interpreting it. Do not repeat the raw lists back verbatim."
     )
 
 
@@ -480,9 +612,15 @@ def _call_gemini_summary(model, prompt):
     raise RuntimeError(f"Summary generation failed: {last_error}")
 
 
-def generate_ai_summary(column_info, plan, provider: str, api_key: str, model_name: str = None) -> str:
+def generate_ai_summary(column_info, plan, provider: str, api_key: str, model_name: str = None,
+                         aggregates=None, reference_text: str = None) -> str:
     """
     Returns a short plain-English explanation of the dashboard's logic.
+    aggregates: output of compute_group_aggregates(), grounds the summary in
+        real GROUP BY-style numbers instead of just chart metadata.
+    reference_text: optional free-text description of the kind of dashboard
+        the user wants (e.g. pasted from a reference file) — used to steer
+        emphasis, never required.
     Raises AuthError / RuntimeError on failure — caller decides whether a
     missing/failed summary should block the rest of the export (it shouldn't;
     the charts and Excel file are useful without it).
@@ -499,7 +637,7 @@ def generate_ai_summary(column_info, plan, provider: str, api_key: str, model_na
     if not model_name:
         model_name = pe.DEFAULT_OPENAI_MODEL if provider == pe.PROVIDER_OPENAI else pe.DEFAULT_GEMINI_MODEL
 
-    prompt = _build_summary_prompt(column_info, plan)
+    prompt = _build_summary_prompt(column_info, plan, aggregates=aggregates, reference_text=reference_text)
 
     if provider == pe.PROVIDER_OPENAI:
         client = OpenAI(api_key=api_key)
