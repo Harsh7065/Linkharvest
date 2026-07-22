@@ -2,17 +2,20 @@
 ai_assistant.py
 Backend logic for the "AI Assistant" sidebar page in LinkHarvest.
 
-A Copilot-style helper: attach 1-3 images (a screenshot of a spreadsheet,
-a table, an error message, a chart, a whiteboard sketch — anything visual)
-plus, optionally, an actual Excel/CSV file, and a plain-English prompt.
-It writes the logic you asked for — SQL, DAX, Python, an Excel formula,
-VBA, or anything else the prompt requests — reasoning from what's in the
-images and/or the real column names, dtypes, and a small sample of rows
-read directly from the attached spreadsheet.
+A Copilot-style helper: attach up to MAX_ATTACHMENTS (4) files of any
+supported type via a single unified picker — images (screenshots of a
+spreadsheet, a table, an error message, a chart, a whiteboard sketch),
+an Excel/CSV file, audio, PDFs, or even a whole folder (expanded to its
+supported files) — plus a plain-English prompt. It writes the logic you
+asked for — SQL, DAX, Python, an Excel formula, VBA, or anything else the
+prompt requests — reasoning from what's in the images and/or the real
+column names, dtypes, and a small sample of rows read directly from the
+attached spreadsheet, plus transcribed audio and extracted PDF text.
 
-Reuses the same OpenAI/Gemini provider plumbing (constants, saved .env
-keys, default models) as pdf_extractor.py so the key you already saved
-there works here automatically.
+Reuses the same provider plumbing (constants, saved .env keys, default
+models) as pdf_extractor.py so a key already saved there works here
+automatically. Supports 4 providers: Gemini, OpenAI, Grok (xAI), and
+Ollama (local, no API key needed).
 
 No UI code lives here. Keep this importable and testable on its own.
 """
@@ -56,9 +59,14 @@ class AuthError(Exception):
     """Raised when the selected provider's API key is missing or invalid."""
 
 
-MAX_IMAGES = 3
-ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+MAX_IMAGES = 3  # kept for backwards compatibility; the unified picker below uses MAX_ATTACHMENTS
+MAX_ATTACHMENTS = 4  # total files across all types in one request (the unified "+" picker)
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS  # backwards-compat alias
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac"}
+PDF_EXTENSIONS = {".pdf"}
+ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | SPREADSHEET_EXTENSIONS | AUDIO_EXTENSIONS | PDF_EXTENSIONS
 MAX_SPREADSHEET_SAMPLE_ROWS = 8
 MAX_SPREADSHEET_SHEETS_PROFILED = 5
 MAX_RETRIES = 3
@@ -131,8 +139,44 @@ def build_spreadsheet_context(file_path: str) -> str:
     return "\n".join(blocks)
 
 
+def build_pdf_context(file_path: str) -> str:
+    """Reads a PDF's text (via pdf_extractor's reader) to fold in as ground-truth context."""
+    try:
+        text = pe.extract_text_from_pdf(file_path)
+    except RuntimeError as e:
+        return f"[Could not read attached PDF '{os.path.basename(file_path)}': {e}]"
+    return f"Attached PDF: {os.path.basename(file_path)}\n{text[:pe.MAX_TEXT_CHARS]}"
+
+
+def transcribe_audio(provider: str, client, audio_path: str) -> str:
+    """
+    Transcribes an attached audio file to fold in as text context.
+    Supported for OpenAI (Whisper) and Gemini (native audio understanding).
+    Grok/Ollama don't currently have an audio path here — returns a note
+    instead of raising, so the rest of the attachments still go through.
+    """
+    name = os.path.basename(audio_path)
+    if provider == pe.PROVIDER_OPENAI:
+        try:
+            with open(audio_path, "rb") as f:
+                text = client.audio.transcriptions.create(model="whisper-1", file=f).text
+            return f"Attached audio ({name}) transcript:\n{text}"
+        except OpenAIAPIError as e:
+            return f"[Could not transcribe attached audio '{name}': {e}]"
+    elif provider == pe.PROVIDER_GEMINI:
+        try:
+            uploaded = genai.upload_file(audio_path)
+            resp = client.generate_content(["Transcribe this audio verbatim.", uploaded])
+            return f"Attached audio ({name}) transcript:\n{resp.text}"
+        except GoogleAPIError as e:
+            return f"[Could not transcribe attached audio '{name}': {e}]"
+    return f"[Audio attachment '{name}' skipped — transcription isn't supported for the '{provider}' provider yet.]"
+
+
 def is_provider_available(provider: str) -> bool:
-    return OPENAI_AVAILABLE if provider == pe.PROVIDER_OPENAI else GEMINI_AVAILABLE
+    if provider == pe.PROVIDER_GEMINI:
+        return GEMINI_AVAILABLE
+    return OPENAI_AVAILABLE  # OpenAI, Grok, and Ollama all ride the openai package
 
 
 def validate_images(image_paths: list) -> list:
@@ -147,6 +191,68 @@ def validate_images(image_paths: list) -> list:
     return valid[:MAX_IMAGES]
 
 
+def classify_attachment(path: str) -> str:
+    """Returns 'image' | 'spreadsheet' | 'audio' | 'pdf' | 'folder' | 'unknown'."""
+    if not path:
+        return "unknown"
+    if os.path.isdir(path):
+        return "folder"
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in SPREADSHEET_EXTENSIONS:
+        return "spreadsheet"
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    if ext in PDF_EXTENSIONS:
+        return "pdf"
+    return "unknown"
+
+
+def expand_attachments(paths: list) -> list:
+    """
+    Expands any folder entries into their contained files (non-recursive,
+    only recognized extensions) and drops unreadable/unsupported paths.
+    Applied before validate_attachments so a folder counts as "however many
+    files it contained" against the MAX_ATTACHMENTS cap.
+    """
+    expanded = []
+    for path in paths:
+        if not path:
+            continue
+        if os.path.isdir(path):
+            for name in sorted(os.listdir(path)):
+                full = os.path.join(path, name)
+                if os.path.isfile(full) and os.path.splitext(full)[1].lower() in ATTACHMENT_EXTENSIONS:
+                    expanded.append(full)
+        elif os.path.isfile(path):
+            expanded.append(path)
+    return expanded
+
+
+def validate_attachments(paths: list) -> dict:
+    """
+    Takes up to MAX_ATTACHMENTS raw paths (files and/or folders) from the
+    unified '+' picker and sorts them into the buckets ask_assistant needs.
+    Only the first attached spreadsheet is used as ground-truth context
+    (matches the existing single-spreadsheet-context behavior); extra
+    spreadsheets beyond the first are ignored with no error.
+    """
+    files = expand_attachments(paths)[:MAX_ATTACHMENTS]
+    buckets = {"images": [], "spreadsheet": None, "audio": [], "pdfs": []}
+    for f in files:
+        kind = classify_attachment(f)
+        if kind == "image":
+            buckets["images"].append(f)
+        elif kind == "spreadsheet" and buckets["spreadsheet"] is None:
+            buckets["spreadsheet"] = f
+        elif kind == "audio":
+            buckets["audio"].append(f)
+        elif kind == "pdf":
+            buckets["pdfs"].append(f)
+    return buckets
+
+
 # --------------------------------------------------------------------------
 # OpenAI (vision via image_url data URLs)
 # --------------------------------------------------------------------------
@@ -158,7 +264,8 @@ def _encode_image_data_url(path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def _call_openai_assist(client, model_name, prompt, image_paths):
+def _call_openai_compat_assist(client, model_name, prompt, image_paths):
+    """Shared by OpenAI, Grok, and Ollama (llava etc.) — same chat.completions shape."""
     content = [{"type": "text", "text": prompt}]
     for path in image_paths:
         content.append({"type": "image_url", "image_url": {"url": _encode_image_data_url(path)}})
@@ -177,15 +284,15 @@ def _call_openai_assist(client, model_name, prompt, image_paths):
             )
             return response.choices[0].message.content.strip()
         except OpenAIAuthenticationError as e:
-            raise AuthError(f"Invalid or missing OpenAI API key: {e}")
+            raise AuthError(f"Invalid or missing API key: {e}")
         except (OpenAIAPITimeoutError, OpenAIRateLimitError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
                 continue
-            raise RuntimeError(f"OpenAI timed out/rate-limited after {MAX_RETRIES} attempts: {e}")
+            raise RuntimeError(f"API timed out/rate-limited after {MAX_RETRIES} attempts: {e}")
         except OpenAIAPIError as e:
-            raise RuntimeError(f"OpenAI API error (check the model name '{model_name}' supports images): {e}")
+            raise RuntimeError(f"API error (check the model name '{model_name}' supports images): {e}")
     raise RuntimeError(f"Request failed: {last_error}")
 
 
@@ -227,42 +334,72 @@ def _call_gemini_assist(model, prompt, image_paths):
 # --------------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------------
-def ask_assistant(prompt: str, image_paths: list, provider: str, api_key: str,
-                   model_name: str = None, spreadsheet_path: str = None) -> str:
+def _make_client(provider: str, api_key: str, model_name: str = None, base_url: str = None):
+    if provider == pe.PROVIDER_OPENAI:
+        return OpenAI(api_key=api_key)
+    elif provider == pe.PROVIDER_GROK:
+        return OpenAI(api_key=api_key, base_url=pe.GROK_BASE_URL)
+    elif provider == pe.PROVIDER_OLLAMA:
+        return OpenAI(api_key=api_key or pe.OLLAMA_PLACEHOLDER_KEY, base_url=base_url or pe.OLLAMA_DEFAULT_BASE_URL)
+    elif provider == pe.PROVIDER_GEMINI:
+        genai.configure(api_key=api_key)
+        return genai.GenerativeModel(model_name or pe.DEFAULT_GEMINI_MODEL, system_instruction=SYSTEM_PROMPT)
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+def ask_assistant(prompt: str, attachment_paths: list, provider: str, api_key: str,
+                   model_name: str = None, base_url: str = None,
+                   image_paths: list = None, spreadsheet_path: str = None) -> str:
     """
     prompt: the user's instruction, e.g. "Write the DAX measure for this".
-    image_paths: 0-3 paths to screenshots/images providing context.
-    spreadsheet_path: optional path to an attached .xlsx/.xls/.csv file — its
-        real column names/dtypes and a small sample of rows are read (never
-        the whole file) and folded into the prompt as ground-truth context.
+    attachment_paths: 0-MAX_ATTACHMENTS paths from the unified '+' picker —
+        any mix of images, one spreadsheet, audio files, PDFs, and/or
+        folders (folders are expanded to their contained supported files).
+    provider: one of pe.PROVIDER_OPENAI/GEMINI/GROK/OLLAMA.
+    base_url: only used for PROVIDER_OLLAMA — the local server URL.
+    image_paths / spreadsheet_path: deprecated, kept for backwards
+        compatibility — merged into attachment_paths if attachment_paths
+        is empty and these are given instead.
     Returns the assistant's markdown-formatted response (explanation + code block).
     Raises AuthError on a missing/invalid key, RuntimeError on other failures.
     """
-    if provider not in (pe.PROVIDER_OPENAI, pe.PROVIDER_GEMINI):
+    if provider not in pe.ALL_PROVIDERS:
         raise ValueError(f"Unknown provider: {provider}")
     if not is_provider_available(provider):
-        pkg = "openai" if provider == pe.PROVIDER_OPENAI else "google-generativeai"
+        pkg = "google-generativeai" if provider == pe.PROVIDER_GEMINI else "openai"
         raise RuntimeError(f"The '{pkg}' package isn't installed. Run: pip install {pkg}")
-    if not api_key:
+    if pe.provider_requires_api_key(provider) and not api_key:
         raise AuthError(f"No {provider.title()} API key configured.")
     if not prompt or not prompt.strip():
         raise ValueError("Please describe what you want written.")
 
-    images = validate_images(image_paths)
+    # Backwards-compat: callers still passing the old separate params.
+    if not attachment_paths and (image_paths or spreadsheet_path):
+        attachment_paths = list(image_paths or []) + ([spreadsheet_path] if spreadsheet_path else [])
 
-    full_prompt = prompt.strip()
-    sheet_path = validate_spreadsheet(spreadsheet_path) if spreadsheet_path else None
-    if sheet_path:
-        full_prompt = f"{full_prompt}\n\n{build_spreadsheet_context(sheet_path)}"
+    buckets = validate_attachments(attachment_paths or [])
+    images = buckets["images"]
 
     model_name = (model_name or "").strip()
     if not model_name:
-        model_name = pe.DEFAULT_OPENAI_MODEL if provider == pe.PROVIDER_OPENAI else pe.DEFAULT_GEMINI_MODEL
+        model_name = {
+            pe.PROVIDER_OPENAI: pe.DEFAULT_OPENAI_MODEL,
+            pe.PROVIDER_GEMINI: pe.DEFAULT_GEMINI_MODEL,
+            pe.PROVIDER_GROK: pe.DEFAULT_GROK_MODEL,
+            pe.PROVIDER_OLLAMA: pe.DEFAULT_OLLAMA_MODEL,
+        }[provider]
 
-    if provider == pe.PROVIDER_OPENAI:
-        client = OpenAI(api_key=api_key)
-        return _call_openai_assist(client, model_name, full_prompt, images)
+    client = _make_client(provider, api_key, model_name=model_name, base_url=base_url)
+
+    full_prompt = prompt.strip()
+    if buckets["spreadsheet"]:
+        full_prompt = f"{full_prompt}\n\n{build_spreadsheet_context(buckets['spreadsheet'])}"
+    for pdf_path in buckets["pdfs"]:
+        full_prompt = f"{full_prompt}\n\n{build_pdf_context(pdf_path)}"
+    for audio_path in buckets["audio"]:
+        full_prompt = f"{full_prompt}\n\n{transcribe_audio(provider, client, audio_path)}"
+
+    if provider == pe.PROVIDER_GEMINI:
+        return _call_gemini_assist(client, full_prompt, images)
     else:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name, system_instruction=SYSTEM_PROMPT)
-        return _call_gemini_assist(model, full_prompt, images)
+        return _call_openai_compat_assist(client, model_name, full_prompt, images)
