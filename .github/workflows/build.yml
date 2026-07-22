@@ -50,6 +50,12 @@ jobs:
           files: dist/LinkHarvest.exe
           generate_release_notes: true
 
+      - name: Checkout main branch for commit
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout main
+
       # --- Auto lock-out step -------------------------------------------
       # After a successful build + release, bump control.json's
       # min_version to this release's version and commit it straight to
@@ -81,12 +87,6 @@ jobs:
               json.dump(data, f, indent=2)
               f.write("\n")
           PY
-
-      - name: Checkout main branch for commit
-        shell: bash
-        run: |
-          git fetch origin main
-          git checkout main
 
       - name: Commit and push control.json
         shell: bash

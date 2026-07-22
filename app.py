@@ -27,6 +27,7 @@ import sheet_editor as se
 import dashboard_builder as db
 import ai_assistant as aa
 import copilot as cp
+import app_stats as stats
 from donut_chart import render_donut
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -36,6 +37,16 @@ ctk.set_default_color_theme("blue")
 DEFAULT_THREADS = 10
 DEFAULT_TIMEOUT = 30
 DEFAULT_PDF_THREADS = 10
+
+# Display labels for the AI Engine dropdown, shared by the PDF Extractor
+# and AI Assistant pages. Keys are pe.PROVIDER_* constants.
+PROVIDER_DISPLAY_NAMES = {
+    pe.PROVIDER_GEMINI: "Gemini — Free tier",
+    pe.PROVIDER_OPENAI: "OpenAI (gpt-5)",
+    pe.PROVIDER_GROK: "Grok (xAI)",
+    pe.PROVIDER_OLLAMA: "Ollama (Local) — Free",
+}
+PROVIDER_DISPLAY_TO_KEY = {v: k for k, v in PROVIDER_DISPLAY_NAMES.items()}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ICON_PATH = os.path.join(BASE_DIR, "assets", "icon.ico")
@@ -53,17 +64,20 @@ APP_BG = ("gray95", "#0b1626")
 CARD_BG = ("gray97", "#101f36")
 CARD_BORDER = ("#c7d7f5", "#1f3a5f")
 
+# Badge colors for the Dashboard's stat-card icons, matching the reference
+# design's blue / green / purple / gold accents.
+STAT_BLUE = "#2f6fed"
+STAT_GREEN = "#2fae63"
+STAT_PURPLE = "#8b5cf6"
+STAT_GOLD = "#d4a72c"
+
 # Each entry here is one row in the sidebar. Add a tuple to this list to
 # register a new feature/page without touching the layout code.
 NAV_ITEMS = [
-    ("ai_copilot", "🤖", "AI Copilot"),
+    ("dashboard_home", "📊", "Dashboard"),
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
     ("data_profiler", "🧹", "Data Profiler"),
-    ("sheet_editor", "✏️", "Excel Editor"),
-    ("dashboard_builder", "📊", "Dashboard Builder"),
-    ("ai_assistant", "🤖", "AI Assistant"),
-    ("support", "❤", "Support"),
 ]
 
 
@@ -109,7 +123,7 @@ class App(ctk.CTk):
 
         self.assistant_queue = queue.Queue()
         self.assistant_thread = None
-        self.assistant_image_entries = []
+        self.asst_attachment_paths = []  # unified "+" attach picker state (images/sheet/audio/pdf/folder)
 
         self.copilot_queue = queue.Queue()
         self.copilot_thread = None
@@ -163,7 +177,7 @@ class App(ctk.CTk):
         self.splash_frame.destroy()
 
         self._build_layout()
-        self._show_page("ai_copilot")
+        self._show_page("dashboard_home")
 
         self.after(150, self._poll_log_queue)
         self.after(150, self._poll_pdf_log_queue)
@@ -191,14 +205,14 @@ class App(ctk.CTk):
         self.content_host.grid_columnconfigure(0, weight=1)
         self.content_host.grid_rowconfigure(0, weight=1)
 
-        self.pages["ai_copilot"] = self._build_ai_copilot_page(self.content_host)
+        self.pages["dashboard_home"] = self._build_dashboard_home_page(self.content_host)
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
-        self.pages["sheet_editor"] = self._build_sheet_editor_page(self.content_host)
-        self.pages["dashboard_builder"] = self._build_dashboard_builder_page(self.content_host)
-        self.pages["ai_assistant"] = self._build_ai_assistant_page(self.content_host)
-        self.pages["support"] = self._build_support_page(self.content_host)
+        # AI Copilot / Sheet Editor / Dashboard Builder / AI Assistant / Support
+        # are no longer in the sidebar (nav now matches the reference design
+        # exactly), but their _build_*_page methods are left intact further
+        # down in this file in case you want to bring any of them back.
 
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
@@ -248,6 +262,8 @@ class App(ctk.CTk):
                 btn.configure(fg_color=SIDEBAR_BTN_INACTIVE, text_color=("gray10", "gray90"))
         self.pages[key].tkraise()
         self.current_page = key
+        if key == "dashboard_home":
+            self._refresh_dashboard_home()
 
     # Small helper so every page gets a consistent scrollable, padded body
     # (keeps things usable if the window gets short/narrow).
@@ -267,6 +283,138 @@ class App(ctk.CTk):
         body.grid(row=1, column=0, sticky="nsew", padx=20, pady=(4, 20))
         body.grid_columnconfigure(0, weight=1)
         return page, body
+
+    # ==================================================================
+    # PAGE: Dashboard (home) — KPI stat cards, recent activity, quick
+    # actions. Numbers/activity are read from app_stats.py, which the
+    # Downloader / PDF Extractor / Data Profiler jobs write to when they
+    # finish (see the stats.record_* calls in each page's job function).
+    # ==================================================================
+    def _build_dashboard_home_page(self, parent):
+        page, body = self._new_page(
+            parent, "Dashboard",
+            "Welcome back! Here's what's happening with your data.")
+
+        self.dash_stat_values = {}
+
+        stat_row = ctk.CTkFrame(body, fg_color="transparent")
+        stat_row.pack(fill="x", pady=(0, 14))
+        for i in range(4):
+            stat_row.grid_columnconfigure(i, weight=1, uniform="dash_stat")
+
+        stat_defs = [
+            ("total_downloads", "⬇", STAT_BLUE, "Total Downloads", "0", "Files downloaded"),
+            ("pdfs_processed", "📄", STAT_BLUE, "PDFs Processed", "0", "Documents extracted"),
+            ("issues_resolved", "🧹", STAT_PURPLE, "Files Cleaned", "0", "Issues resolved"),
+            (None, "🏷", STAT_GOLD, "Current Version", f"v{__version__}", "You're up to date"),
+        ]
+        for i, (key, icon, color, title, value, caption) in enumerate(stat_defs):
+            card, value_lbl = self._build_stat_card(stat_row, icon, color, title, value, caption)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
+            if key:
+                self.dash_stat_values[key] = value_lbl
+
+        bottom = ctk.CTkFrame(body, fg_color="transparent")
+        bottom.pack(fill="both", expand=True)
+        bottom.grid_columnconfigure(0, weight=2)
+        bottom.grid_columnconfigure(1, weight=1)
+        bottom.grid_rowconfigure(0, weight=1)
+
+        # --- Recent Activity ---
+        activity_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
+                                      border_color=CARD_BORDER, fg_color=CARD_BG)
+        activity_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(activity_card, text="Recent Activity", font=ctk.CTkFont(weight="bold", size=15)
+                     ).pack(anchor="w", padx=16, pady=(14, 8))
+        self.dash_activity_container = ctk.CTkFrame(activity_card, fg_color="transparent")
+        self.dash_activity_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        # --- Quick Actions ---
+        actions_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
+                                     border_color=CARD_BORDER, fg_color=CARD_BG)
+        actions_card.grid(row=0, column=1, sticky="nsew")
+        ctk.CTkLabel(actions_card, text="Quick Actions", font=ctk.CTkFont(weight="bold", size=15)
+                     ).pack(anchor="w", padx=16, pady=(14, 8))
+
+        quick_actions = [
+            ("▶", "Start Link Downloader", "Download files from links in Excel",
+             STAT_BLUE, lambda: self._show_page("downloader")),
+            ("📄", "Extract from PDF", "Extract data using AI",
+             STAT_GREEN, lambda: self._show_page("pdf_extractor")),
+            ("🧹", "Profile your Data", "Analyze data quality and issues",
+             STAT_PURPLE, lambda: self._show_page("data_profiler")),
+            ("📈", "View Analytics", "See reports and insights",
+             ("gray70", "gray30"), self._show_analytics_placeholder),
+        ]
+        for icon, title, subtitle, color, command in quick_actions:
+            btn = ctk.CTkButton(
+                actions_card, text=f"{icon}   {title}\n     {subtitle}",
+                anchor="w", justify="left", height=54, corner_radius=10,
+                fg_color=color, font=ctk.CTkFont(size=12, weight="bold"),
+                command=command)
+            btn.pack(fill="x", padx=16, pady=6)
+
+        return page
+
+    def _build_stat_card(self, parent, icon, badge_color, title, value_text, caption):
+        """One KPI tile for the Dashboard: colored icon badge + label on top,
+        big value, small caption underneath. Returns (card_frame, value_label)
+        so callers can update the number later."""
+        card = ctk.CTkFrame(parent, corner_radius=12, border_width=1,
+                             border_color=CARD_BORDER, fg_color=CARD_BG)
+
+        top_row = ctk.CTkFrame(card, fg_color="transparent")
+        top_row.pack(fill="x", padx=16, pady=(14, 0))
+        ctk.CTkLabel(top_row, text=icon, width=32, height=32, corner_radius=8,
+                     fg_color=badge_color, font=ctk.CTkFont(size=14)).pack(side="left")
+        ctk.CTkLabel(top_row, text=title, font=ctk.CTkFont(size=12), text_color="gray"
+                     ).pack(side="left", padx=(10, 0))
+
+        value_lbl = ctk.CTkLabel(card, text=value_text, font=ctk.CTkFont(size=26, weight="bold"),
+                                  anchor="w")
+        value_lbl.pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(card, text=caption, font=ctk.CTkFont(size=11), text_color="gray", anchor="w"
+                     ).pack(anchor="w", padx=16, pady=(0, 14))
+        return card, value_lbl
+
+    def _refresh_dashboard_home(self):
+        s = stats.load_stats()
+        for key, label in self.dash_stat_values.items():
+            label.configure(text=f"{s.get(key, 0):,}")
+
+        for widget in self.dash_activity_container.winfo_children():
+            widget.destroy()
+
+        activity = s.get("activity", [])
+        if not activity:
+            ctk.CTkLabel(self.dash_activity_container,
+                         text="No activity yet — run a download, extraction, or profiling "
+                              "job and it'll show up here.",
+                         font=ctk.CTkFont(size=12), text_color="gray",
+                         wraplength=360, justify="left").pack(anchor="w", pady=10)
+            return
+
+        icon_map = {"downloader": "📥", "pdf": "📄", "profiler": "🧹"}
+        for entry in activity[:6]:
+            row = ctk.CTkFrame(self.dash_activity_container, fg_color="transparent")
+            row.pack(fill="x", pady=5)
+            ctk.CTkLabel(row, text=icon_map.get(entry.get("icon"), "•"), width=28, height=28,
+                         corner_radius=8, fg_color=CARD_BORDER, font=ctk.CTkFont(size=13)
+                         ).pack(side="left")
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side="left", fill="x", expand=True, padx=(10, 0))
+            ctk.CTkLabel(text_col, text=entry.get("text", ""), font=ctk.CTkFont(size=12, weight="bold"),
+                         anchor="w").pack(anchor="w")
+            ctk.CTkLabel(text_col, text=entry.get("detail", ""), font=ctk.CTkFont(size=11),
+                         text_color="gray", anchor="w").pack(anchor="w")
+            ctk.CTkLabel(row, text=stats.format_relative_time(entry.get("timestamp", "")),
+                         font=ctk.CTkFont(size=11), text_color="gray").pack(side="right")
+
+    def _show_analytics_placeholder(self):
+        # Screen 5 of the reference design (Download Analytics) isn't built
+        # yet — this is a placeholder hook so the Quick Actions button does
+        # something sensible until that page exists.
+        messagebox.showinfo("Coming soon", "Download Analytics is on the roadmap — not built yet.")
 
     # ==================================================================
     # PAGE: AI Copilot — describe a task, get a runnable step-by-step plan
@@ -763,6 +911,8 @@ class App(ctk.CTk):
         if failed:
             summary += " Some links may remain un-downloaded — see the log above."
         self.log_queue.put(("info", summary))
+        if ok:
+            stats.record_download(ok, failed, folder_path)
         self.log_queue.put(("done", None))
 
     def _poll_log_queue(self):
@@ -789,7 +939,8 @@ class App(ctk.CTk):
     def _build_pdf_extractor_page(self, parent):
         page, body = self._new_page(
             parent, "PDF Extractor",
-            "Describe what to pull from a folder of PDFs — accurate, multithreaded, your choice of AI engine")
+            "Describe what to pull from a folder of PDFs (and, optionally, images/audio/video in that "
+            "same folder) — accurate, multithreaded, your choice of AI engine")
 
         # --- Configuration: AI provider + API key ---
         cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
@@ -800,12 +951,22 @@ class App(ctk.CTk):
         provider_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
         provider_line.pack(fill="x", padx=16, pady=(0, 4))
         ctk.CTkLabel(provider_line, text="AI Engine", width=110, anchor="w").pack(side="left")
-        self.provider_selector = ctk.CTkSegmentedButton(
-            provider_line, values=["Gemini (Flash) — Free tier", "OpenAI (gpt-5)"],
+        self.provider_selector = ctk.CTkOptionMenu(
+            provider_line, values=list(PROVIDER_DISPLAY_NAMES.values()),
             command=self._on_provider_change)
-        self.provider_selector.set("Gemini (Flash) — Free tier")
+        self.provider_selector.set(PROVIDER_DISPLAY_NAMES[pe.PROVIDER_GEMINI])
         self.provider_selector.pack(side="left", fill="x", expand=True, padx=6)
-        self._pdf_provider = pe.PROVIDER_GEMINI  # internal state, kept in sync with the selector
+        self._pdf_provider = pe.PROVIDER_GEMINI  # internal state, kept in sync with the dropdown
+
+        ollama_url_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        ollama_url_line.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(ollama_url_line, text="Server URL", width=110, anchor="w").pack(side="left")
+        self.pdf_ollama_url_entry = ctk.CTkEntry(ollama_url_line)
+        self.pdf_ollama_url_entry.insert(0, pe.load_ollama_base_url())
+        self.pdf_ollama_url_entry.pack(side="left", fill="x", expand=True, padx=6)
+        ctk.CTkLabel(ollama_url_line, text="", width=70).pack(side="left")
+        self.pdf_ollama_url_row = ollama_url_line
+        ollama_url_line.pack_forget()  # only shown when provider == Ollama
 
         get_key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
         get_key_line.pack(fill="x", padx=16, pady=(0, 10))
@@ -868,6 +1029,25 @@ class App(ctk.CTk):
 
         self.pdf_source_folder = self._path_row(step1_frame, "Source Folder", self._browse_pdf_source)
 
+        ctk.CTkLabel(step1_frame, text="Also include from that same folder:",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16, pady=(4, 0))
+        filetype_line = ctk.CTkFrame(step1_frame, fg_color="transparent")
+        filetype_line.pack(fill="x", padx=16, pady=(2, 12))
+        self.pdf_include_images = ctk.BooleanVar(value=False)
+        self.pdf_include_audio = ctk.BooleanVar(value=False)
+        self.pdf_include_video = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(filetype_line, text="Images (scanned docs)", variable=self.pdf_include_images
+                         ).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(filetype_line, text="Audio", variable=self.pdf_include_audio
+                         ).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(filetype_line, text="Video", variable=self.pdf_include_video
+                         ).pack(side="left")
+        ctk.CTkLabel(step1_frame,
+                     text="Images need a vision-capable model; audio/video currently need Gemini "
+                          "(OpenAI can transcribe audio only). PDFs always work on any provider.",
+                     font=ctk.CTkFont(size=10), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 4))
+
         # --- Step 2: output ---
         step2_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         step2_frame.pack(fill="x", pady=10)
@@ -884,13 +1064,31 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
 
         slider_line = ctk.CTkFrame(pdf_adv_frame, fg_color="transparent")
-        slider_line.pack(fill="x", padx=16, pady=(0, 12))
+        slider_line.pack(fill="x", padx=16, pady=(0, 6))
         self.pdf_threads_label = ctk.CTkLabel(slider_line, text=f"Concurrent Threads: {DEFAULT_PDF_THREADS}")
         self.pdf_threads_label.pack(anchor="w")
         self.pdf_threads_slider = ctk.CTkSlider(slider_line, from_=1, to=20, number_of_steps=19,
                                                  command=self._on_pdf_threads_change)
         self.pdf_threads_slider.set(DEFAULT_PDF_THREADS)
         self.pdf_threads_slider.pack(fill="x", pady=(6, 0))
+
+        batch_line = ctk.CTkFrame(pdf_adv_frame, fg_color="transparent")
+        batch_line.pack(fill="x", padx=16, pady=(4, 4))
+        self.pdf_batch_label = ctk.CTkLabel(batch_line, text="Batch Size: 1 file per request")
+        self.pdf_batch_label.pack(anchor="w")
+        self.pdf_batch_slider = ctk.CTkSlider(batch_line, from_=1, to=pe.MAX_BATCH_SIZE,
+                                               number_of_steps=pe.MAX_BATCH_SIZE - 1,
+                                               command=self._on_pdf_batch_change)
+        self.pdf_batch_slider.set(1)
+        self.pdf_batch_slider.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(pdf_adv_frame,
+                     text="Packs several documents into a single AI request instead of one request each — "
+                          "fewer requests total, which helps free-tier rate limits and cuts paid per-request "
+                          "overhead. Applies to PDFs and images only (audio/video always run one per request). "
+                          "Higher values give each document less room in the prompt, so keep this at 1 for very "
+                          "long/detailed documents.",
+                     font=ctk.CTkFont(size=10), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 12))
 
         # --- Progress + start ---
         self.pdf_progress_bar = ctk.CTkProgressBar(body)
@@ -927,10 +1125,16 @@ class App(ctk.CTk):
     def _on_pdf_threads_change(self, value):
         self.pdf_threads_label.configure(text=f"Concurrent Threads: {int(value)}")
 
+    def _on_pdf_batch_change(self, value):
+        n = int(value)
+        text = "Batch Size: 1 file per request (off)" if n == 1 else f"Batch Size: {n} files per request"
+        self.pdf_batch_label.configure(text=text)
+
     def _on_provider_change(self, selection):
-        self._pdf_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
-                               else pe.PROVIDER_GEMINI)
-        label = "OpenAI API Key" if self._pdf_provider == pe.PROVIDER_OPENAI else "Gemini API Key"
+        self._pdf_provider = PROVIDER_DISPLAY_TO_KEY.get(selection, pe.PROVIDER_GEMINI)
+        needs_key = pe.provider_requires_api_key(self._pdf_provider)
+
+        label = f"{self._pdf_provider.title()} API Key"
         self.api_key_field_label.configure(text=label)
 
         # Swap in whichever key is already saved for the newly selected provider.
@@ -941,43 +1145,59 @@ class App(ctk.CTk):
                 self.api_key_entry.insert(0, existing_key)
         except Exception:
             pass
+        self.api_key_entry.configure(state="normal" if needs_key else "disabled")
         self.api_key_status.configure(
-            text="Key is stored locally in a .env file, never uploaded anywhere.",
+            text=("Key is stored locally in a .env file, never uploaded anywhere." if needs_key
+                  else "Ollama runs locally — no API key needed."),
             text_color="gray")
 
+        # Show the local server-URL field only for Ollama.
+        if self._pdf_provider == pe.PROVIDER_OLLAMA:
+            self.pdf_ollama_url_row.pack(fill="x", padx=16, pady=(0, 4))
+        else:
+            self.pdf_ollama_url_row.pack_forget()
+
         # Swap the model dropdown's suggestions + default for the new provider.
-        default_model = (pe.DEFAULT_OPENAI_MODEL if self._pdf_provider == pe.PROVIDER_OPENAI
-                          else pe.DEFAULT_GEMINI_MODEL)
+        default_model = pe.PROVIDER_DEFAULT_MODEL[self._pdf_provider]
         self.model_combo.configure(values=pe.SUGGESTED_MODELS[self._pdf_provider])
         self.model_combo.set(default_model)
 
-        key_label = "OpenAI" if self._pdf_provider == pe.PROVIDER_OPENAI else "Gemini"
-        free_note = " (free)" if self._pdf_provider == pe.PROVIDER_GEMINI else ""
-        self.get_key_btn.configure(text=f"🔗 Get a{free_note} {key_label} API key")
+        if self._pdf_provider == pe.PROVIDER_OLLAMA:
+            self.get_key_btn.configure(text="🔗 Install Ollama", command=lambda: webbrowser.open("https://ollama.com/download"))
+        else:
+            free_note = " (free)" if self._pdf_provider == pe.PROVIDER_GEMINI else ""
+            key_label = self._pdf_provider.title() if self._pdf_provider != pe.PROVIDER_GROK else "Grok"
+            self.get_key_btn.configure(text=f"🔗 Get a{free_note} {key_label} API key",
+                                        command=self._open_key_signup_page)
 
         self._refresh_provider_availability_warning()
 
     def _open_key_signup_page(self):
-        url = ("https://aistudio.google.com/apikey" if self._pdf_provider == pe.PROVIDER_GEMINI
-               else "https://platform.openai.com/api-keys")
-        webbrowser.open(url)
+        urls = {
+            pe.PROVIDER_GEMINI: "https://aistudio.google.com/apikey",
+            pe.PROVIDER_OPENAI: "https://platform.openai.com/api-keys",
+            pe.PROVIDER_GROK: "https://console.x.ai",
+        }
+        webbrowser.open(urls.get(self._pdf_provider, "https://platform.openai.com/api-keys"))
 
     def _refresh_provider_availability_warning(self):
         if pe.is_provider_available(self._pdf_provider):
             self.provider_warning.configure(text="")
             return
-        pkg = "openai" if self._pdf_provider == pe.PROVIDER_OPENAI else "google-generativeai"
+        pkg = "google-generativeai" if self._pdf_provider == pe.PROVIDER_GEMINI else "openai"
         self.provider_warning.configure(
             text=f"⚠ The '{pkg}' package isn't installed. Run: pip install {pkg}")
 
     def _save_api_key(self):
         key = self.api_key_entry.get().strip()
-        if not key:
+        if not key and pe.provider_requires_api_key(self._pdf_provider):
             messagebox.showerror("Missing key", "Please enter an API key first.")
             return
         try:
+            if self._pdf_provider == pe.PROVIDER_OLLAMA:
+                pe.save_ollama_base_url(self.pdf_ollama_url_entry.get().strip())
             pe.save_api_key(key, provider=self._pdf_provider)
-            self.api_key_status.configure(text="✓ Key saved to .env", text_color="#3ca34d")
+            self.api_key_status.configure(text="✓ Saved", text_color="#3ca34d")
         except Exception as e:
             messagebox.showerror("Couldn't save key", str(e))
 
@@ -988,20 +1208,22 @@ class App(ctk.CTk):
 
         provider = self._pdf_provider
         if not pe.is_provider_available(provider):
-            pkg = "openai" if provider == pe.PROVIDER_OPENAI else "google-generativeai"
+            pkg = "google-generativeai" if provider == pe.PROVIDER_GEMINI else "openai"
             messagebox.showerror("Missing dependency",
                                   f"The '{pkg}' package isn't installed.\nRun: pip install {pkg}")
             return
 
         api_key = self.api_key_entry.get().strip()
+        base_url = self.pdf_ollama_url_entry.get().strip() if provider == pe.PROVIDER_OLLAMA else None
         model_name = self.model_combo.get().strip()
         instructions = self.pdf_instructions.get("1.0", "end").strip()
         source_folder = self.pdf_source_folder.get().strip()
         output_excel = self.pdf_output_excel.get().strip()
         sheet_name = self.pdf_sheet_name.get().strip()
         threads = int(self.pdf_threads_slider.get())
+        batch_size = int(self.pdf_batch_slider.get())
 
-        if not api_key:
+        if pe.provider_requires_api_key(provider) and not api_key:
             messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
             return
         if not instructions:
@@ -1017,9 +1239,17 @@ class App(ctk.CTk):
             messagebox.showerror("Missing info", "Please enter a sheet/workbook name.")
             return
 
-        pdfs = pe.list_pdfs(source_folder)
+        include_images = self.pdf_include_images.get() if hasattr(self, "pdf_include_images") else False
+        include_audio = self.pdf_include_audio.get() if hasattr(self, "pdf_include_audio") else False
+        include_video = self.pdf_include_video.get() if hasattr(self, "pdf_include_video") else False
+        pdfs = pe.list_source_files(source_folder, include_pdf=True,
+                                     include_images=include_images,
+                                     include_audio=include_audio,
+                                     include_video=include_video)
         if not pdfs:
-            messagebox.showerror("No PDFs found", "No .pdf files were found in that folder.")
+            messagebox.showerror("No files found",
+                                  "No matching files (PDF, and/or the checked image/audio/video types) "
+                                  "were found in that folder.")
             return
 
         self.pdf_start_btn.configure(state="disabled", text="Extracting...")
@@ -1029,13 +1259,15 @@ class App(ctk.CTk):
 
         self.pdf_thread = threading.Thread(
             target=self._run_pdf_extraction_job,
-            args=(pdfs, instructions, provider, api_key, model_name, threads, output_excel, sheet_name),
+            args=(pdfs, instructions, provider, api_key, model_name, threads, output_excel, sheet_name, base_url, batch_size),
             daemon=True)
         self.pdf_thread.start()
 
-    def _run_pdf_extraction_job(self, pdfs, instructions, provider, api_key, model_name, threads, output_excel, sheet_name):
-        engine_name = "OpenAI" if provider == pe.PROVIDER_OPENAI else "Gemini"
-        self.pdf_log_queue.put(("info", f"Found {len(pdfs)} PDF(s). Extracting with {engine_name} ({model_name}) using {threads} thread(s)..."))
+    def _run_pdf_extraction_job(self, pdfs, instructions, provider, api_key, model_name, threads,
+                                 output_excel, sheet_name, base_url=None, batch_size=1):
+        engine_name = PROVIDER_DISPLAY_NAMES.get(provider, provider.title())
+        batch_note = "" if batch_size <= 1 else f", batching {batch_size} files/request"
+        self.pdf_log_queue.put(("info", f"Found {len(pdfs)} file(s). Extracting with {engine_name} ({model_name}) using {threads} thread(s){batch_note}..."))
 
         def progress_cb(done, total):
             self.pdf_log_queue.put(("progress", (done, total)))
@@ -1045,7 +1277,7 @@ class App(ctk.CTk):
 
         try:
             results = pe.run_extraction(pdfs, instructions, provider, api_key, threads, progress_cb, log_cb,
-                                         model_name=model_name)
+                                         model_name=model_name, base_url=base_url, batch_size=batch_size)
         except pe.AuthError as e:
             self.pdf_log_queue.put(("error", f"Authentication failed: {e}"))
             self.pdf_log_queue.put(("done", None))
@@ -1066,6 +1298,8 @@ class App(ctk.CTk):
         failed = len(results) - ok
         summary = f"Done. {ok} succeeded, {failed} failed. Saved to {output_excel}"
         self.pdf_log_queue.put(("info", summary))
+        if ok:
+            stats.record_pdf_extraction(ok, failed, output_excel)
         self.pdf_log_queue.put(("success", output_excel))
         self.pdf_log_queue.put(("done", None))
 
@@ -1300,6 +1534,9 @@ class App(ctk.CTk):
         except ValueError as e:
             messagebox.showerror("Couldn't save file", str(e))
             return
+
+        issues_resolved = self.profiler_results.get("total_anomalies", 0) if self.profiler_results else 0
+        stats.record_profiler_clean(issues_resolved, save_path)
 
         messagebox.showinfo(
             "Export complete",
@@ -1986,7 +2223,6 @@ class App(ctk.CTk):
             return
 
         column_info = db.classify_columns(df)
-        plan = db.suggest_chart_plan(df, column_info)
         aggregates = db.compute_group_aggregates(df, column_info)
 
         combined_reference = reference_text
@@ -1994,6 +2230,24 @@ class App(ctk.CTk):
             file_text = db.read_reference_text(reference_file)
             if file_text:
                 combined_reference = f"{combined_reference}\n\n{file_text}".strip()
+
+        plan = None
+        plan_error = None
+        if combined_reference and api_key:
+            # Only take this path when the user actually gave a reference —
+            # otherwise this is a silent behavior change for the common
+            # "just build me something" case, which should keep using the
+            # deterministic heuristic it always has.
+            try:
+                plan = db.suggest_chart_plan_ai(
+                    df, column_info, combined_reference, provider, api_key,
+                    model_name=model_name, aggregates=aggregates)
+            except db.AuthError as e:
+                plan_error = f"Authentication failed, using default chart plan instead: {e}"
+            except Exception as e:
+                plan_error = f"Reference-based planning failed, using default chart plan instead: {e}"
+        if plan is None:
+            plan = db.suggest_chart_plan(df, column_info)
 
         summary = ""
         summary_error = None
@@ -2007,7 +2261,7 @@ class App(ctk.CTk):
             except Exception as e:
                 summary_error = f"Summary generation failed (charts still built): {e}"
 
-        self.dashboard_queue.put(("built", (df, column_info, plan, summary, summary_error)))
+        self.dashboard_queue.put(("built", (df, column_info, plan, summary, summary_error, plan_error)))
 
     def _poll_dashboard_queue(self):
         try:
@@ -2023,7 +2277,7 @@ class App(ctk.CTk):
             pass
         self.after(150, self._poll_dashboard_queue)
 
-    def _on_dashboard_built(self, df, column_info, plan, summary, summary_error):
+    def _on_dashboard_built(self, df, column_info, plan, summary, summary_error, plan_error=None):
         self.dashboard_df = df
         self.dashboard_column_info = column_info
         self.dashboard_plan = plan
@@ -2037,6 +2291,8 @@ class App(ctk.CTk):
             plan_lines = [f"[{p['chart_type'].upper()}] {p['title']} — {p['reason']}" for p in plan]
         else:
             plan_lines = ["Not enough structured columns to suggest charts for this file."]
+        if plan_error:
+            plan_lines.insert(0, f"⚠ {plan_error}\n")
         self._set_textbox(self.dash_plan_box, "\n\n".join(plan_lines))
 
         for widget in self.dash_chart_host.winfo_children():
@@ -2125,8 +2381,8 @@ class App(ctk.CTk):
     def _build_ai_assistant_page(self, parent):
         page, body = self._new_page(
             parent, "AI Assistant",
-            "Attach up to 3 images and/or an Excel/CSV file, then describe what to write — "
-            "SQL, DAX, Python, an Excel formula, VBA, and more")
+            f"Attach up to {aa.MAX_ATTACHMENTS} files of any kind — image, spreadsheet, audio, PDF, or "
+            "a folder — then describe what to write: SQL, DAX, Python, an Excel formula, VBA, and more")
 
         # --- AI configuration (reuses the same provider/key already saved for PDF Extractor) ---
         cfg_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
@@ -2137,12 +2393,21 @@ class App(ctk.CTk):
         asst_provider_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
         asst_provider_line.pack(fill="x", padx=16, pady=(0, 4))
         ctk.CTkLabel(asst_provider_line, text="AI Engine", width=110, anchor="w").pack(side="left")
-        self.asst_provider_selector = ctk.CTkSegmentedButton(
-            asst_provider_line, values=["Gemini (Flash) — Free tier", "OpenAI (gpt-5)"],
+        self.asst_provider_selector = ctk.CTkOptionMenu(
+            asst_provider_line, values=list(PROVIDER_DISPLAY_NAMES.values()),
             command=self._on_asst_provider_change)
-        self.asst_provider_selector.set("Gemini (Flash) — Free tier")
+        self.asst_provider_selector.set(PROVIDER_DISPLAY_NAMES[pe.PROVIDER_GEMINI])
         self.asst_provider_selector.pack(side="left", fill="x", expand=True, padx=6)
         self._asst_provider = pe.PROVIDER_GEMINI
+
+        asst_ollama_url_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        asst_ollama_url_line.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkLabel(asst_ollama_url_line, text="Server URL", width=110, anchor="w").pack(side="left")
+        self.asst_ollama_url_entry = ctk.CTkEntry(asst_ollama_url_line)
+        self.asst_ollama_url_entry.insert(0, pe.load_ollama_base_url())
+        self.asst_ollama_url_entry.pack(side="left", fill="x", expand=True, padx=6)
+        self.asst_ollama_url_row = asst_ollama_url_line
+        asst_ollama_url_line.pack_forget()  # only shown when provider == Ollama
 
         asst_key_line = ctk.CTkFrame(cfg_frame, fg_color="transparent")
         asst_key_line.pack(fill="x", padx=16, pady=(0, 6))
@@ -2171,7 +2436,7 @@ class App(ctk.CTk):
         self.asst_model_combo.pack(side="left", fill="x", expand=True, padx=6)
 
         ctk.CTkLabel(cfg_frame,
-                     text="Use a vision-capable model — the suggested defaults both support images.",
+                     text="Use a vision-capable model if you're attaching images — the suggested defaults do.",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w", padx=16, pady=(0, 10))
 
         self.asst_provider_warning = ctk.CTkLabel(cfg_frame, text="", text_color="#e0a020",
@@ -2179,44 +2444,28 @@ class App(ctk.CTk):
         self.asst_provider_warning.pack(anchor="w", padx=16, pady=(0, 10))
         self._refresh_asst_provider_warning()
 
-        # --- Image attachments ---
+        # --- Unified attachments ("+" picker) ---
         img_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
         img_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(img_frame, text="Attach Images (up to 3, optional)",
-                     font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6), anchor="w", padx=16)
+        attach_header = ctk.CTkFrame(img_frame, fg_color="transparent")
+        attach_header.pack(fill="x", padx=16, pady=(12, 6))
+        ctk.CTkLabel(attach_header, text=f"Attachments (up to {aa.MAX_ATTACHMENTS}, optional)",
+                     font=ctk.CTkFont(weight="bold", size=14)).pack(side="left")
+        self.asst_add_btn = ctk.CTkButton(attach_header, text="+  Add", width=70, height=26,
+                                           command=self._browse_asst_attachment)
+        self.asst_add_btn.pack(side="right")
 
-        self.assistant_image_entries = []
-        for i in range(aa.MAX_IMAGES):
-            row = ctk.CTkFrame(img_frame, fg_color="transparent")
-            row.pack(fill="x", padx=16, pady=4)
-            ctk.CTkLabel(row, text=f"Image {i + 1}", width=70, anchor="w").pack(side="left")
-            entry = ctk.CTkEntry(row)
-            entry.pack(side="left", fill="x", expand=True, padx=6)
-            ctk.CTkButton(row, text="Browse", width=80,
-                          command=lambda e=entry: self._browse_asst_image(e)).pack(side="left", padx=(0, 4))
-            ctk.CTkButton(row, text="Clear", width=60, fg_color="transparent", border_width=1,
-                          text_color=("gray20", "gray85"),
-                          command=lambda e=entry: e.delete(0, "end")).pack(side="left")
-            self.assistant_image_entries.append(entry)
-
-        ctk.CTkFrame(img_frame, height=1, fg_color=("gray80", "gray30")).pack(fill="x", padx=16, pady=(8, 8))
-        ctk.CTkLabel(img_frame, text="Attach a Spreadsheet (optional — .xlsx, .xls, .csv)",
-                     font=ctk.CTkFont(weight="bold", size=13)).pack(anchor="w", padx=16, pady=(0, 6))
-        sheet_row = ctk.CTkFrame(img_frame, fg_color="transparent")
-        sheet_row.pack(fill="x", padx=16, pady=(0, 4))
-        self.asst_sheet_entry = ctk.CTkEntry(sheet_row)
-        self.asst_sheet_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ctk.CTkButton(sheet_row, text="Browse", width=80,
-                      command=self._browse_asst_sheet).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(sheet_row, text="Clear", width=60, fg_color="transparent", border_width=1,
-                      text_color=("gray20", "gray85"),
-                      command=lambda: self.asst_sheet_entry.delete(0, "end")).pack(side="left")
         ctk.CTkLabel(img_frame,
-                     text="Real column names, types, and a small sample of rows are read from this "
-                          "file and given to the AI as ground truth alongside any images.",
+                     text="Image, Excel/CSV, audio, PDF, or a whole folder (its supported files are all "
+                          "added, up to the limit). Real column names/dtypes + sample rows are read from "
+                          "any attached spreadsheet; audio is transcribed; PDFs are read as text.",
                      font=ctk.CTkFont(size=10), text_color="gray", wraplength=650,
-                     justify="left").pack(anchor="w", padx=16, pady=(4, 0))
-        ctk.CTkLabel(img_frame, text="", height=6).pack()
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.asst_attachments_list_frame = ctk.CTkFrame(img_frame, fg_color="transparent")
+        self.asst_attachments_list_frame.pack(fill="x", padx=16, pady=(0, 12))
+        self.asst_attachment_paths = []  # list[str], the source of truth for what's attached
+        self._render_asst_attachments()
 
         # --- Prompt ---
         prompt_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
@@ -2251,24 +2500,65 @@ class App(ctk.CTk):
 
         return page
 
-    def _browse_asst_image(self, entry):
-        path = filedialog.askopenfilename(
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp *.gif *.bmp")])
-        if path:
-            entry.delete(0, "end")
-            entry.insert(0, path)
+    _ATTACHMENT_ICONS = {"image": "🖼", "spreadsheet": "📊", "audio": "🎵", "pdf": "📄", "folder": "📁", "unknown": "📎"}
 
-    def _browse_asst_sheet(self):
-        path = filedialog.askopenfilename(filetypes=[("Spreadsheet files", "*.xlsx *.xls *.csv")])
-        if path:
-            self.asst_sheet_entry.delete(0, "end")
-            self.asst_sheet_entry.insert(0, path)
+    def _render_asst_attachments(self):
+        """Redraws the attachment chip list from self.asst_attachment_paths."""
+        for child in self.asst_attachments_list_frame.winfo_children():
+            child.destroy()
+
+        if not self.asst_attachment_paths:
+            ctk.CTkLabel(self.asst_attachments_list_frame, text="No attachments yet — click + Add.",
+                         font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w")
+            return
+
+        for path in list(self.asst_attachment_paths):
+            kind = aa.classify_attachment(path)
+            icon = self._ATTACHMENT_ICONS.get(kind, "📎")
+            row = ctk.CTkFrame(self.asst_attachments_list_frame, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=f"{icon} {os.path.basename(path)}", anchor="w").pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(row, text="Remove", width=70, height=24, fg_color="transparent", border_width=1,
+                          text_color=("gray20", "gray85"),
+                          command=lambda p=path: self._remove_asst_attachment(p)).pack(side="right")
+
+    def _browse_asst_attachment(self):
+        if len(self.asst_attachment_paths) >= aa.MAX_ATTACHMENTS:
+            messagebox.showinfo("Limit reached", f"You can attach up to {aa.MAX_ATTACHMENTS} files at once.")
+            return
+        paths = filedialog.askopenfilenames(
+            filetypes=[
+                ("All supported", "*.png *.jpg *.jpeg *.webp *.gif *.bmp *.tiff "
+                                   "*.xlsx *.xls *.csv *.mp3 *.wav *.m4a *.flac *.ogg *.aac *.pdf"),
+                ("Images", "*.png *.jpg *.jpeg *.webp *.gif *.bmp *.tiff"),
+                ("Spreadsheets", "*.xlsx *.xls *.csv"),
+                ("Audio", "*.mp3 *.wav *.m4a *.flac *.ogg *.aac"),
+                ("PDF", "*.pdf"),
+                ("All files", "*.*"),
+            ])
+        added_any = bool(paths)
+        for p in paths:
+            if len(self.asst_attachment_paths) >= aa.MAX_ATTACHMENTS:
+                messagebox.showinfo("Limit reached", f"Only the first {aa.MAX_ATTACHMENTS} files were added.")
+                break
+            if p not in self.asst_attachment_paths:
+                self.asst_attachment_paths.append(p)
+        if not added_any:
+            # Nothing picked as files — offer a folder instead.
+            folder = filedialog.askdirectory()
+            if folder and len(self.asst_attachment_paths) < aa.MAX_ATTACHMENTS:
+                self.asst_attachment_paths.append(folder)
+        self._render_asst_attachments()
+
+    def _remove_asst_attachment(self, path):
+        self.asst_attachment_paths = [p for p in self.asst_attachment_paths if p != path]
+        self._render_asst_attachments()
 
     def _on_asst_provider_change(self, selection):
-        self._asst_provider = (pe.PROVIDER_OPENAI if selection.startswith("OpenAI")
-                                else pe.PROVIDER_GEMINI)
-        label = "OpenAI API Key" if self._asst_provider == pe.PROVIDER_OPENAI else "Gemini API Key"
-        self.asst_api_key_field_label.configure(text=label)
+        self._asst_provider = PROVIDER_DISPLAY_TO_KEY.get(selection, pe.PROVIDER_GEMINI)
+        needs_key = pe.provider_requires_api_key(self._asst_provider)
+
+        self.asst_api_key_field_label.configure(text=f"{self._asst_provider.title()} API Key")
         self.asst_api_key_entry.delete(0, "end")
         try:
             existing_key = pe.load_api_key(self._asst_provider)
@@ -2276,8 +2566,18 @@ class App(ctk.CTk):
                 self.asst_api_key_entry.insert(0, existing_key)
         except Exception:
             pass
-        default_model = (pe.DEFAULT_OPENAI_MODEL if self._asst_provider == pe.PROVIDER_OPENAI
-                          else pe.DEFAULT_GEMINI_MODEL)
+        self.asst_api_key_entry.configure(state="normal" if needs_key else "disabled")
+        self.asst_api_key_status.configure(
+            text=("Same key already saved for PDF Extractor is reused here automatically." if needs_key
+                  else "Ollama runs locally — no API key needed."),
+            text_color="gray")
+
+        if self._asst_provider == pe.PROVIDER_OLLAMA:
+            self.asst_ollama_url_row.pack(fill="x", padx=16, pady=(0, 4))
+        else:
+            self.asst_ollama_url_row.pack_forget()
+
+        default_model = pe.PROVIDER_DEFAULT_MODEL[self._asst_provider]
         self.asst_model_combo.configure(values=pe.SUGGESTED_MODELS[self._asst_provider])
         self.asst_model_combo.set(default_model)
         self._refresh_asst_provider_warning()
@@ -2286,18 +2586,20 @@ class App(ctk.CTk):
         if aa.is_provider_available(self._asst_provider):
             self.asst_provider_warning.configure(text="")
             return
-        pkg = "openai" if self._asst_provider == pe.PROVIDER_OPENAI else "google-generativeai"
+        pkg = "google-generativeai" if self._asst_provider == pe.PROVIDER_GEMINI else "openai"
         self.asst_provider_warning.configure(
             text=f"⚠ The '{pkg}' package isn't installed. Run: pip install {pkg}")
 
     def _save_asst_api_key(self):
         key = self.asst_api_key_entry.get().strip()
-        if not key:
+        if not key and pe.provider_requires_api_key(self._asst_provider):
             messagebox.showerror("Missing key", "Please enter an API key first.")
             return
         try:
+            if self._asst_provider == pe.PROVIDER_OLLAMA:
+                pe.save_ollama_base_url(self.asst_ollama_url_entry.get().strip())
             pe.save_api_key(key, provider=self._asst_provider)
-            self.asst_api_key_status.configure(text="✓ Key saved to .env", text_color="#3ca34d")
+            self.asst_api_key_status.configure(text="✓ Saved", text_color="#3ca34d")
         except Exception as e:
             messagebox.showerror("Couldn't save key", str(e))
 
@@ -2308,33 +2610,22 @@ class App(ctk.CTk):
 
         provider = self._asst_provider
         if not aa.is_provider_available(provider):
-            pkg = "openai" if provider == pe.PROVIDER_OPENAI else "google-generativeai"
+            pkg = "google-generativeai" if provider == pe.PROVIDER_GEMINI else "openai"
             messagebox.showerror("Missing dependency",
                                   f"The '{pkg}' package isn't installed.\nRun: pip install {pkg}")
             return
 
         api_key = self.asst_api_key_entry.get().strip()
+        base_url = self.asst_ollama_url_entry.get().strip() if provider == pe.PROVIDER_OLLAMA else None
         model_name = self.asst_model_combo.get().strip()
         prompt = self.asst_prompt.get("1.0", "end").strip()
-        image_paths = [e.get().strip() for e in self.assistant_image_entries if e.get().strip()]
-        sheet_path = self.asst_sheet_entry.get().strip()
+        attachment_paths = list(self.asst_attachment_paths)
 
-        if not api_key:
+        if pe.provider_requires_api_key(provider) and not api_key:
             messagebox.showerror("Missing info", f"Please enter and save your {provider.title()} API key.")
             return
         if not prompt:
             messagebox.showerror("Missing info", "Please describe what you want written.")
-            return
-
-        images = aa.validate_images(image_paths)
-        if image_paths and not images:
-            messagebox.showerror("Invalid images",
-                                  "None of the attached paths are readable image files "
-                                  "(png/jpg/jpeg/webp/gif/bmp).")
-            return
-        if sheet_path and not aa.validate_spreadsheet(sheet_path):
-            messagebox.showerror("Invalid spreadsheet",
-                                  "The attached file isn't a readable .xlsx/.xls/.csv.")
             return
 
         self.asst_ask_btn.configure(state="disabled", text="Thinking...")
@@ -2342,14 +2633,14 @@ class App(ctk.CTk):
 
         self.assistant_thread = threading.Thread(
             target=self._run_asst_job,
-            args=(prompt, images, provider, api_key, model_name, sheet_path),
+            args=(prompt, attachment_paths, provider, api_key, model_name, base_url),
             daemon=True)
         self.assistant_thread.start()
 
-    def _run_asst_job(self, prompt, images, provider, api_key, model_name, sheet_path=None):
+    def _run_asst_job(self, prompt, attachment_paths, provider, api_key, model_name, base_url=None):
         try:
-            response = aa.ask_assistant(prompt, images, provider, api_key,
-                                         model_name=model_name, spreadsheet_path=sheet_path)
+            response = aa.ask_assistant(prompt, attachment_paths, provider, api_key,
+                                         model_name=model_name, base_url=base_url)
         except aa.AuthError as e:
             self.assistant_queue.put(("error", f"Authentication failed: {e}"))
             return
