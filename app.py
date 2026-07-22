@@ -27,6 +27,7 @@ import sheet_editor as se
 import dashboard_builder as db
 import ai_assistant as aa
 import copilot as cp
+import app_stats as stats
 from donut_chart import render_donut
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -63,17 +64,20 @@ APP_BG = ("gray95", "#0b1626")
 CARD_BG = ("gray97", "#101f36")
 CARD_BORDER = ("#c7d7f5", "#1f3a5f")
 
+# Badge colors for the Dashboard's stat-card icons, matching the reference
+# design's blue / green / purple / gold accents.
+STAT_BLUE = "#2f6fed"
+STAT_GREEN = "#2fae63"
+STAT_PURPLE = "#8b5cf6"
+STAT_GOLD = "#d4a72c"
+
 # Each entry here is one row in the sidebar. Add a tuple to this list to
 # register a new feature/page without touching the layout code.
 NAV_ITEMS = [
-    ("ai_copilot", "🤖", "AI Copilot"),
+    ("dashboard_home", "📊", "Dashboard"),
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
     ("data_profiler", "🧹", "Data Profiler"),
-    ("sheet_editor", "✏️", "Excel Editor"),
-    ("dashboard_builder", "📊", "Dashboard Builder"),
-    ("ai_assistant", "🤖", "AI Assistant"),
-    ("support", "❤", "Support"),
 ]
 
 
@@ -173,7 +177,7 @@ class App(ctk.CTk):
         self.splash_frame.destroy()
 
         self._build_layout()
-        self._show_page("ai_copilot")
+        self._show_page("dashboard_home")
 
         self.after(150, self._poll_log_queue)
         self.after(150, self._poll_pdf_log_queue)
@@ -201,14 +205,14 @@ class App(ctk.CTk):
         self.content_host.grid_columnconfigure(0, weight=1)
         self.content_host.grid_rowconfigure(0, weight=1)
 
-        self.pages["ai_copilot"] = self._build_ai_copilot_page(self.content_host)
+        self.pages["dashboard_home"] = self._build_dashboard_home_page(self.content_host)
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
-        self.pages["sheet_editor"] = self._build_sheet_editor_page(self.content_host)
-        self.pages["dashboard_builder"] = self._build_dashboard_builder_page(self.content_host)
-        self.pages["ai_assistant"] = self._build_ai_assistant_page(self.content_host)
-        self.pages["support"] = self._build_support_page(self.content_host)
+        # AI Copilot / Sheet Editor / Dashboard Builder / AI Assistant / Support
+        # are no longer in the sidebar (nav now matches the reference design
+        # exactly), but their _build_*_page methods are left intact further
+        # down in this file in case you want to bring any of them back.
 
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
@@ -258,6 +262,8 @@ class App(ctk.CTk):
                 btn.configure(fg_color=SIDEBAR_BTN_INACTIVE, text_color=("gray10", "gray90"))
         self.pages[key].tkraise()
         self.current_page = key
+        if key == "dashboard_home":
+            self._refresh_dashboard_home()
 
     # Small helper so every page gets a consistent scrollable, padded body
     # (keeps things usable if the window gets short/narrow).
@@ -277,6 +283,138 @@ class App(ctk.CTk):
         body.grid(row=1, column=0, sticky="nsew", padx=20, pady=(4, 20))
         body.grid_columnconfigure(0, weight=1)
         return page, body
+
+    # ==================================================================
+    # PAGE: Dashboard (home) — KPI stat cards, recent activity, quick
+    # actions. Numbers/activity are read from app_stats.py, which the
+    # Downloader / PDF Extractor / Data Profiler jobs write to when they
+    # finish (see the stats.record_* calls in each page's job function).
+    # ==================================================================
+    def _build_dashboard_home_page(self, parent):
+        page, body = self._new_page(
+            parent, "Dashboard",
+            "Welcome back! Here's what's happening with your data.")
+
+        self.dash_stat_values = {}
+
+        stat_row = ctk.CTkFrame(body, fg_color="transparent")
+        stat_row.pack(fill="x", pady=(0, 14))
+        for i in range(4):
+            stat_row.grid_columnconfigure(i, weight=1, uniform="dash_stat")
+
+        stat_defs = [
+            ("total_downloads", "⬇", STAT_BLUE, "Total Downloads", "0", "Files downloaded"),
+            ("pdfs_processed", "📄", STAT_BLUE, "PDFs Processed", "0", "Documents extracted"),
+            ("issues_resolved", "🧹", STAT_PURPLE, "Files Cleaned", "0", "Issues resolved"),
+            (None, "🏷", STAT_GOLD, "Current Version", f"v{__version__}", "You're up to date"),
+        ]
+        for i, (key, icon, color, title, value, caption) in enumerate(stat_defs):
+            card, value_lbl = self._build_stat_card(stat_row, icon, color, title, value, caption)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
+            if key:
+                self.dash_stat_values[key] = value_lbl
+
+        bottom = ctk.CTkFrame(body, fg_color="transparent")
+        bottom.pack(fill="both", expand=True)
+        bottom.grid_columnconfigure(0, weight=2)
+        bottom.grid_columnconfigure(1, weight=1)
+        bottom.grid_rowconfigure(0, weight=1)
+
+        # --- Recent Activity ---
+        activity_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
+                                      border_color=CARD_BORDER, fg_color=CARD_BG)
+        activity_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(activity_card, text="Recent Activity", font=ctk.CTkFont(weight="bold", size=15)
+                     ).pack(anchor="w", padx=16, pady=(14, 8))
+        self.dash_activity_container = ctk.CTkFrame(activity_card, fg_color="transparent")
+        self.dash_activity_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        # --- Quick Actions ---
+        actions_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
+                                     border_color=CARD_BORDER, fg_color=CARD_BG)
+        actions_card.grid(row=0, column=1, sticky="nsew")
+        ctk.CTkLabel(actions_card, text="Quick Actions", font=ctk.CTkFont(weight="bold", size=15)
+                     ).pack(anchor="w", padx=16, pady=(14, 8))
+
+        quick_actions = [
+            ("▶", "Start Link Downloader", "Download files from links in Excel",
+             STAT_BLUE, lambda: self._show_page("downloader")),
+            ("📄", "Extract from PDF", "Extract data using AI",
+             STAT_GREEN, lambda: self._show_page("pdf_extractor")),
+            ("🧹", "Profile your Data", "Analyze data quality and issues",
+             STAT_PURPLE, lambda: self._show_page("data_profiler")),
+            ("📈", "View Analytics", "See reports and insights",
+             ("gray70", "gray30"), self._show_analytics_placeholder),
+        ]
+        for icon, title, subtitle, color, command in quick_actions:
+            btn = ctk.CTkButton(
+                actions_card, text=f"{icon}   {title}\n     {subtitle}",
+                anchor="w", justify="left", height=54, corner_radius=10,
+                fg_color=color, font=ctk.CTkFont(size=12, weight="bold"),
+                command=command)
+            btn.pack(fill="x", padx=16, pady=6)
+
+        return page
+
+    def _build_stat_card(self, parent, icon, badge_color, title, value_text, caption):
+        """One KPI tile for the Dashboard: colored icon badge + label on top,
+        big value, small caption underneath. Returns (card_frame, value_label)
+        so callers can update the number later."""
+        card = ctk.CTkFrame(parent, corner_radius=12, border_width=1,
+                             border_color=CARD_BORDER, fg_color=CARD_BG)
+
+        top_row = ctk.CTkFrame(card, fg_color="transparent")
+        top_row.pack(fill="x", padx=16, pady=(14, 0))
+        ctk.CTkLabel(top_row, text=icon, width=32, height=32, corner_radius=8,
+                     fg_color=badge_color, font=ctk.CTkFont(size=14)).pack(side="left")
+        ctk.CTkLabel(top_row, text=title, font=ctk.CTkFont(size=12), text_color="gray"
+                     ).pack(side="left", padx=(10, 0))
+
+        value_lbl = ctk.CTkLabel(card, text=value_text, font=ctk.CTkFont(size=26, weight="bold"),
+                                  anchor="w")
+        value_lbl.pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(card, text=caption, font=ctk.CTkFont(size=11), text_color="gray", anchor="w"
+                     ).pack(anchor="w", padx=16, pady=(0, 14))
+        return card, value_lbl
+
+    def _refresh_dashboard_home(self):
+        s = stats.load_stats()
+        for key, label in self.dash_stat_values.items():
+            label.configure(text=f"{s.get(key, 0):,}")
+
+        for widget in self.dash_activity_container.winfo_children():
+            widget.destroy()
+
+        activity = s.get("activity", [])
+        if not activity:
+            ctk.CTkLabel(self.dash_activity_container,
+                         text="No activity yet — run a download, extraction, or profiling "
+                              "job and it'll show up here.",
+                         font=ctk.CTkFont(size=12), text_color="gray",
+                         wraplength=360, justify="left").pack(anchor="w", pady=10)
+            return
+
+        icon_map = {"downloader": "📥", "pdf": "📄", "profiler": "🧹"}
+        for entry in activity[:6]:
+            row = ctk.CTkFrame(self.dash_activity_container, fg_color="transparent")
+            row.pack(fill="x", pady=5)
+            ctk.CTkLabel(row, text=icon_map.get(entry.get("icon"), "•"), width=28, height=28,
+                         corner_radius=8, fg_color=CARD_BORDER, font=ctk.CTkFont(size=13)
+                         ).pack(side="left")
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side="left", fill="x", expand=True, padx=(10, 0))
+            ctk.CTkLabel(text_col, text=entry.get("text", ""), font=ctk.CTkFont(size=12, weight="bold"),
+                         anchor="w").pack(anchor="w")
+            ctk.CTkLabel(text_col, text=entry.get("detail", ""), font=ctk.CTkFont(size=11),
+                         text_color="gray", anchor="w").pack(anchor="w")
+            ctk.CTkLabel(row, text=stats.format_relative_time(entry.get("timestamp", "")),
+                         font=ctk.CTkFont(size=11), text_color="gray").pack(side="right")
+
+    def _show_analytics_placeholder(self):
+        # Screen 5 of the reference design (Download Analytics) isn't built
+        # yet — this is a placeholder hook so the Quick Actions button does
+        # something sensible until that page exists.
+        messagebox.showinfo("Coming soon", "Download Analytics is on the roadmap — not built yet.")
 
     # ==================================================================
     # PAGE: AI Copilot — describe a task, get a runnable step-by-step plan
@@ -773,6 +911,8 @@ class App(ctk.CTk):
         if failed:
             summary += " Some links may remain un-downloaded — see the log above."
         self.log_queue.put(("info", summary))
+        if ok:
+            stats.record_download(ok, failed, folder_path)
         self.log_queue.put(("done", None))
 
     def _poll_log_queue(self):
@@ -1158,6 +1298,8 @@ class App(ctk.CTk):
         failed = len(results) - ok
         summary = f"Done. {ok} succeeded, {failed} failed. Saved to {output_excel}"
         self.pdf_log_queue.put(("info", summary))
+        if ok:
+            stats.record_pdf_extraction(ok, failed, output_excel)
         self.pdf_log_queue.put(("success", output_excel))
         self.pdf_log_queue.put(("done", None))
 
@@ -1392,6 +1534,9 @@ class App(ctk.CTk):
         except ValueError as e:
             messagebox.showerror("Couldn't save file", str(e))
             return
+
+        issues_resolved = self.profiler_results.get("total_anomalies", 0) if self.profiler_results else 0
+        stats.record_profiler_clean(issues_resolved, save_path)
 
         messagebox.showinfo(
             "Export complete",
