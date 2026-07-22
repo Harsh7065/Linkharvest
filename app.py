@@ -78,10 +78,6 @@ NAV_ITEMS = [
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
     ("data_profiler", "🧹", "Data Profiler"),
-    ("sheet_editor", "✏️", "Excel Editor"),
-    ("dashboard_builder", "📊", "Dashboard Builder"),
-    ("ai_assistant", "🤖", "AI Assistant"),
-    ("support", "❤", "Support"),
 ]
 
 
@@ -213,10 +209,10 @@ class App(ctk.CTk):
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
-        self.pages["sheet_editor"] = self._build_sheet_editor_page(self.content_host)
-        self.pages["dashboard_builder"] = self._build_dashboard_builder_page(self.content_host)
-        self.pages["ai_assistant"] = self._build_ai_assistant_page(self.content_host)
-        self.pages["support"] = self._build_support_page(self.content_host)
+        # AI Copilot / Sheet Editor / Dashboard Builder / AI Assistant / Support
+        # are no longer in the sidebar (nav now matches the reference design
+        # exactly), but their _build_*_page methods are left intact further
+        # down in this file in case you want to bring any of them back.
 
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")

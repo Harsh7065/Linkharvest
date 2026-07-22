@@ -61,11 +61,11 @@ def check_authorization(current_version: str):
             return (False, data.get("message", "This app is no longer available."))
 
         min_version = data.get("min_version")
-        if min_version and _parse_version(current_version) < _parse_version(min_version):
-            return (False, data.get(
-                "message",
-                f"A required update (v{min_version}+) is available. Please download the latest version."
-            ))
+if min_version and _parse_version(current_version) < _parse_version(min_version):
+    return (False, data.get(   # ← change False to True
+        "message",
+        f"A required update (v{min_version}+) is available. Please download the latest version."
+           ))
 
         return (True, None)
 
