@@ -28,6 +28,7 @@ import dashboard_builder as db
 import ai_assistant as aa
 import copilot as cp
 import app_stats as stats
+import format_matcher as fm
 from donut_chart import render_donut
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -78,6 +79,12 @@ NAV_ITEMS = [
     ("downloader", "🔗", "Link Downloader"),
     ("pdf_extractor", "📄", "PDF Extractor"),
     ("data_profiler", "🧹", "Data Profiler"),
+    ("format_matcher", "🧩", "Format Matcher"),
+    ("sheet_editor", "✏", "Excel Editor"),
+    ("dashboard_builder", "📈", "Dashboard Builder"),
+    ("ai_assistant", "🤖", "AI Assistant"),
+    ("ai_copilot", "🧭", "AI Copilot"),
+    ("support", "❤", "Support"),
 ]
 
 
@@ -108,6 +115,9 @@ class App(ctk.CTk):
 
         self.pdf_log_queue = queue.Queue()
         self.pdf_thread = None
+
+        self.fm_queue = queue.Queue()
+        self.fm_thread = None
 
         self.editor_queue = queue.Queue()
         self.editor_thread = None
@@ -181,6 +191,7 @@ class App(ctk.CTk):
 
         self.after(150, self._poll_log_queue)
         self.after(150, self._poll_pdf_log_queue)
+        self.after(150, self._poll_fm_queue)
         self.after(150, self._poll_editor_queue)
         self.after(150, self._poll_dashboard_queue)
         self.after(150, self._poll_assistant_queue)
@@ -209,6 +220,12 @@ class App(ctk.CTk):
         self.pages["downloader"] = self._build_downloader_page(self.content_host)
         self.pages["pdf_extractor"] = self._build_pdf_extractor_page(self.content_host)
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
+        self.pages["format_matcher"] = self._build_format_matcher_page(self.content_host)
+        self.pages["sheet_editor"] = self._build_sheet_editor_page(self.content_host)
+        self.pages["dashboard_builder"] = self._build_dashboard_builder_page(self.content_host)
+        self.pages["ai_assistant"] = self._build_ai_assistant_page(self.content_host)
+        self.pages["ai_copilot"] = self._build_ai_copilot_page(self.content_host)
+        self.pages["support"] = self._build_support_page(self.content_host)
         # AI Copilot / Sheet Editor / Dashboard Builder / AI Assistant / Support
         # are no longer in the sidebar (nav now matches the reference design
         # exactly), but their _build_*_page methods are left intact further
@@ -1328,6 +1345,162 @@ class App(ctk.CTk):
                              f"Extraction finished.\nResults saved to:\n{output_excel_path}")
         try:
             folder = os.path.dirname(os.path.abspath(output_excel_path))
+            if os.name == "nt":
+                os.startfile(folder)
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass  # opening the folder is a convenience, never fatal
+
+    # ==================================================================
+    # PAGE: Format Matcher — paste data into a reference file, keeping
+    # its exact formatting (fonts, fills, borders, merges, number
+    # formats, row heights, freeze panes).
+    # ==================================================================
+    def _build_format_matcher_page(self, parent):
+        page, body = self._new_page(
+            parent, "Format Matcher",
+            "Paste your data into a reference Excel file, keeping every bit of its formatting.")
+
+        files_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
+        files_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(files_frame, text="Files", font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+
+        self.fm_reference_path = self._path_row(files_frame, "Reference File", self._browse_excel)
+        self.fm_reference_sheet = self._entry_row(files_frame, "Sheet (optional)", "")
+        self.fm_data_path = self._path_row(files_frame, "Data File", self._browse_fm_data)
+        self.fm_data_sheet = self._entry_row(files_frame, "Sheet (optional)", "")
+
+        opts_line = ctk.CTkFrame(files_frame, fg_color="transparent")
+        opts_line.pack(fill="x", padx=16, pady=(4, 12))
+        self.fm_data_has_header = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(opts_line, text="Data file has a header row",
+                         variable=self.fm_data_has_header).pack(side="left", padx=(0, 20))
+        ctk.CTkLabel(opts_line, text="Style/data starts at template row:").pack(side="left")
+        self.fm_style_row_entry = ctk.CTkEntry(opts_line, width=50)
+        self.fm_style_row_entry.insert(0, "2")
+        self.fm_style_row_entry.pack(side="left", padx=6)
+        ctk.CTkLabel(files_frame,
+                     text="That row's font, fill, border, alignment, number format, row height, and "
+                          "merged-cell pattern (if any) get copied onto every pasted row.",
+                     font=ctk.CTkFont(size=11), text_color="gray", wraplength=650,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 10))
+
+        out_frame = ctk.CTkFrame(body, corner_radius=12, border_width=1, border_color=CARD_BORDER, fg_color=CARD_BG)
+        out_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(out_frame, text="Output", font=ctk.CTkFont(weight="bold", size=14)).pack(pady=(12, 6))
+        self.fm_output_path = self._path_row(out_frame, "Save As", self._browse_pdf_output)
+        ctk.CTkLabel(out_frame, text="", height=6).pack()
+
+        self.fm_start_btn = ctk.CTkButton(body, text="Run Format Matcher", height=38,
+                                           command=self._start_format_matcher)
+        self.fm_start_btn.pack(pady=(4, 10))
+
+        self.fm_progress_bar = ctk.CTkProgressBar(body)
+        self.fm_progress_bar.set(0)
+        self.fm_progress_bar.pack(fill="x", pady=(4, 4))
+        self.fm_progress_label = ctk.CTkLabel(body, text="0%", font=ctk.CTkFont(size=12))
+        self.fm_progress_label.pack()
+
+        self.fm_log_box = ctk.CTkTextbox(body, height=140, corner_radius=8)
+        self.fm_log_box.pack(fill="both", expand=True, pady=(10, 0))
+
+        return page
+
+    def _browse_fm_data(self, entry):
+        path = filedialog.askopenfilename(
+            filetypes=[("Excel or CSV files", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")])
+        if path:
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+    def _start_format_matcher(self):
+        if self.fm_thread and self.fm_thread.is_alive():
+            messagebox.showinfo("Busy", "A format-matching job is already running.")
+            return
+
+        reference_path = self.fm_reference_path.get().strip()
+        data_path = self.fm_data_path.get().strip()
+        output_path = self.fm_output_path.get().strip()
+        reference_sheet = self.fm_reference_sheet.get().strip() or None
+        data_sheet = self.fm_data_sheet.get().strip() or None
+        data_has_header = self.fm_data_has_header.get()
+
+        if not reference_path or not os.path.isfile(reference_path):
+            messagebox.showerror("Missing info", "Please select a valid reference (template) file.")
+            return
+        if not data_path or not os.path.isfile(data_path):
+            messagebox.showerror("Missing info", "Please select a valid data file.")
+            return
+        if not output_path:
+            messagebox.showerror("Missing info", "Please choose where to save the result.")
+            return
+        try:
+            style_source_row = int(self.fm_style_row_entry.get().strip())
+            if style_source_row < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Missing info", "Style/data start row must be a whole number, 1 or greater.")
+            return
+
+        self.fm_start_btn.configure(state="disabled", text="Running...")
+        self.fm_progress_bar.set(0)
+        self.fm_progress_label.configure(text="0%")
+        self.fm_log_box.delete("1.0", "end")
+
+        self.fm_thread = threading.Thread(
+            target=self._run_format_matcher_job,
+            args=(reference_path, data_path, output_path, style_source_row,
+                  reference_sheet, data_sheet, data_has_header),
+            daemon=True)
+        self.fm_thread.start()
+
+    def _run_format_matcher_job(self, reference_path, data_path, output_path, style_source_row,
+                                 reference_sheet, data_sheet, data_has_header):
+        def progress_cb(fraction):
+            self.fm_queue.put(("progress", fraction))
+
+        def log_cb(msg):
+            self.fm_queue.put(("info", msg))
+
+        try:
+            fm.apply_template(
+                reference_path, data_path, output_path,
+                style_source_row=style_source_row,
+                reference_sheet_name=reference_sheet, data_sheet_name=data_sheet,
+                data_has_header=data_has_header,
+                progress_cb=progress_cb, log_cb=log_cb)
+        except Exception as e:
+            self.fm_queue.put(("error", f"Format Matcher failed: {e}"))
+            self.fm_queue.put(("done", None))
+            return
+
+        self.fm_queue.put(("success", output_path))
+        self.fm_queue.put(("done", None))
+
+    def _poll_fm_queue(self):
+        try:
+            while True:
+                kind, payload = self.fm_queue.get_nowait()
+                if kind == "progress":
+                    pct = payload
+                    self.fm_progress_bar.set(pct)
+                    self.fm_progress_label.configure(text=f"{int(pct * 100)}%")
+                elif kind in ("info", "error"):
+                    self.fm_log_box.insert("end", f"{payload}\n")
+                    self.fm_log_box.see("end")
+                elif kind == "success":
+                    self._on_fm_success(payload)
+                elif kind == "done":
+                    self.fm_start_btn.configure(state="normal", text="Run Format Matcher")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_fm_queue)
+
+    def _on_fm_success(self, output_path):
+        messagebox.showinfo("Done", f"Data pasted into the template.\nSaved to:\n{output_path}")
+        try:
+            folder = os.path.dirname(os.path.abspath(output_path))
             if os.name == "nt":
                 os.startfile(folder)
             else:

@@ -30,3 +30,6 @@ downloads/
 build/
 _py_src_backup/
 dist/
+
+
+*.bak
