@@ -152,7 +152,31 @@ class App(ctk.CTk):
         # interactive app was built and usable *before* the background
         # authorization check had a chance to block it.
         self._build_splash()
+
+        # The auth check runs on a background thread, but it must NEVER call
+        # self.after()/Tkinter directly from that thread — if the network
+        # check happens to finish before mainloop() has actually started
+        # (fast network, cached DNS, etc.), Tkinter raises "RuntimeError:
+        # main thread is not in main loop" and the app hangs on the splash
+        # screen forever with no visible error. Instead, the thread only
+        # writes its result to a plain thread-safe queue; a poll loop
+        # started here (from the main thread, so it's always safe) is what
+        # actually reads the queue and drives the UI — same pattern used
+        # for every other background job in this file (log_queue, etc.).
+        self.auth_result_queue = queue.Queue()
         threading.Thread(target=self._authorize_then_launch, daemon=True).start()
+        self.after(50, self._poll_auth_queue)
+
+    def _poll_auth_queue(self):
+        try:
+            kind, payload = self.auth_result_queue.get_nowait()
+        except queue.Empty:
+            self.after(50, self._poll_auth_queue)
+            return
+        if kind == "blocked":
+            self._show_authorization_block(payload)
+        else:
+            self._finish_launch()
 
     def _build_splash(self):
         self.splash_frame = ctk.CTkFrame(self, fg_color=APP_BG, corner_radius=0)
