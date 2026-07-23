@@ -33,3 +33,20 @@ dist/
 
 
 *.bak
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment / secrets — never commit API keys
+.env
+*.env
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor/IDE clutter
+.vscode/
+.idea/
