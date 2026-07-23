@@ -366,7 +366,7 @@ class App(ctk.CTk):
         for icon, title, subtitle, color, command in quick_actions:
             btn = ctk.CTkButton(
                 actions_card, text=f"{icon}   {title}\n     {subtitle}",
-                anchor="w", justify="left", height=54, corner_radius=10,
+                anchor="w", height=54, corner_radius=10,
                 fg_color=color, font=ctk.CTkFont(size=12, weight="bold"),
                 command=command)
             btn.pack(fill="x", padx=16, pady=6)
