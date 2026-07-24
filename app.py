@@ -84,6 +84,7 @@ NAV_ITEMS = [
     ("data_profiler", "🧹", "Data Profiler"),
     ("format_matcher", "🧩", "Format Matcher"),
     ("analytics", "📈", "Analytics"),
+    ("activity", "🕓", "Activity"),
     ("sheet_editor", "✏", "Excel Editor"),
     ("dashboard_builder", "📈", "Dashboard Builder"),
     ("ai_assistant", "🤖", "AI Assistant"),
@@ -234,6 +235,7 @@ class App(ctk.CTk):
         self.pages["data_profiler"] = self._build_data_profiler_page(self.content_host)
         self.pages["format_matcher"] = self._build_format_matcher_page(self.content_host)
         self.pages["analytics"] = self._build_analytics_page(self.content_host)
+        self.pages["activity"] = self._build_activity_page(self.content_host)
         self.pages["sheet_editor"] = self._build_sheet_editor_page(self.content_host)
         self.pages["dashboard_builder"] = self._build_dashboard_builder_page(self.content_host)
         self.pages["ai_assistant"] = self._build_ai_assistant_page(self.content_host)
@@ -296,6 +298,8 @@ class App(ctk.CTk):
             self._refresh_dashboard_home()
         if key == "analytics":
             self._refresh_analytics_page()
+        if key == "activity":
+            self._refresh_activity_page()
 
     # Small helper so every page gets a consistent scrollable, padded body
     # (keeps things usable if the window gets short/narrow).
@@ -325,9 +329,10 @@ class App(ctk.CTk):
     def _build_dashboard_home_page(self, parent):
         page, body = self._new_page(
             parent, "Dashboard",
-            "Welcome back! Here's what's happening with your data.")
+            "A quick summary — see Analytics for detailed charts and activity history.")
 
         self.dash_stat_values = {}
+        self.dash_change_labels = {}
 
         stat_row = ctk.CTkFrame(body, fg_color="transparent")
         stat_row.pack(fill="x", pady=(0, 14))
@@ -335,16 +340,18 @@ class App(ctk.CTk):
             stat_row.grid_columnconfigure(i, weight=1, uniform="dash_stat")
 
         stat_defs = [
-            ("total_downloads", "⬇", STAT_BLUE, "Total Downloads", "0", "Files downloaded"),
-            ("pdfs_processed", "📄", STAT_BLUE, "PDFs Processed", "0", "Documents extracted"),
-            ("issues_resolved", "🧹", STAT_PURPLE, "Files Cleaned", "0", "Issues resolved"),
-            (None, "🏷", STAT_GOLD, "Current Version", f"v{__version__}", "You're up to date"),
+            ("total_downloads", "downloads", "⬇", STAT_BLUE, "Total Downloads", "0", "All-time"),
+            ("pdfs_processed", "pdfs", "📄", STAT_BLUE, "PDFs Processed", "0", "All-time"),
+            ("issues_resolved", "issues", "🧹", STAT_PURPLE, "Files Cleaned", "0", "All-time"),
+            (None, None, "🏷", STAT_GOLD, "Current Version", f"v{__version__}", "You're up to date"),
         ]
-        for i, (key, icon, color, title, value, caption) in enumerate(stat_defs):
-            card, value_lbl = self._build_stat_card(stat_row, icon, color, title, value, caption)
+        for i, (key, change_key, icon, color, title, value, caption) in enumerate(stat_defs):
+            card, value_lbl, change_lbl = self._build_stat_card(stat_row, icon, color, title, value, caption)
             card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
             if key:
                 self.dash_stat_values[key] = value_lbl
+            if change_key:
+                self.dash_change_labels[change_key] = change_lbl
 
         bottom = ctk.CTkFrame(body, fg_color="transparent")
         bottom.pack(fill="both", expand=True)
@@ -352,14 +359,14 @@ class App(ctk.CTk):
         bottom.grid_columnconfigure(1, weight=1)
         bottom.grid_rowconfigure(0, weight=1)
 
-        # --- Recent Activity ---
-        activity_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
+        # --- Insights: plain-English bullets instead of a raw activity log ---
+        insights_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
                                       border_color=CARD_BORDER, fg_color=CARD_BG)
-        activity_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ctk.CTkLabel(activity_card, text="Recent Activity", font=ctk.CTkFont(weight="bold", size=15)
-                     ).pack(anchor="w", padx=16, pady=(14, 8))
-        self.dash_activity_container = ctk.CTkFrame(activity_card, fg_color="transparent")
-        self.dash_activity_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        insights_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(insights_card, text="Key Insights (last 7 days)",
+                     font=ctk.CTkFont(weight="bold", size=15)).pack(anchor="w", padx=16, pady=(14, 8))
+        self.dash_insights_container = ctk.CTkFrame(insights_card, fg_color="transparent")
+        self.dash_insights_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
         # --- Quick Actions ---
         actions_card = ctk.CTkFrame(bottom, corner_radius=12, border_width=1,
@@ -375,7 +382,7 @@ class App(ctk.CTk):
              STAT_GREEN, lambda: self._show_page("pdf_extractor")),
             ("🧹", "Profile your Data", "Analyze data quality and issues",
              STAT_PURPLE, lambda: self._show_page("data_profiler")),
-            ("📈", "View Analytics", "See reports and insights",
+            ("📈", "View Analytics", "Charts, history, and detailed stats",
              ("gray70", "gray30"), self._show_analytics_placeholder),
         ]
         for icon, title, subtitle, color, command in quick_actions:
@@ -389,9 +396,10 @@ class App(ctk.CTk):
         return page
 
     def _build_stat_card(self, parent, icon, badge_color, title, value_text, caption):
-        """One KPI tile for the Dashboard: colored icon badge + label on top,
-        big value, small caption underneath. Returns (card_frame, value_label)
-        so callers can update the number later."""
+        """One KPI tile: colored icon badge + label on top, big value, small
+        caption underneath, and an optional %-change badge slot at the
+        bottom (hidden by default — call .configure() on the returned
+        change_lbl to show it). Returns (card_frame, value_label, change_label)."""
         card = ctk.CTkFrame(parent, corner_radius=12, border_width=1,
                              border_color=CARD_BORDER, fg_color=CARD_BG)
 
@@ -406,29 +414,84 @@ class App(ctk.CTk):
                                   anchor="w")
         value_lbl.pack(anchor="w", padx=16, pady=(10, 0))
         ctk.CTkLabel(card, text=caption, font=ctk.CTkFont(size=11), text_color="gray", anchor="w"
-                     ).pack(anchor="w", padx=16, pady=(0, 14))
-        return card, value_lbl
+                     ).pack(anchor="w", padx=16, pady=(0, 2))
+        change_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont(size=11, weight="bold"), anchor="w")
+        change_lbl.pack(anchor="w", padx=16, pady=(0, 14))
+        return card, value_lbl, change_lbl
 
     def _refresh_dashboard_home(self):
         s = stats.load_stats()
         for key, label in self.dash_stat_values.items():
             label.configure(text=f"{s.get(key, 0):,}")
 
-        for widget in self.dash_activity_container.winfo_children():
+        comparison = stats.get_period_comparison(days=7)
+        changes = comparison["changes"]
+        for key, change_lbl in self.dash_change_labels.items():
+            pct = changes.get(key)
+            if pct is None:
+                change_lbl.configure(text="No prior data", text_color="gray")
+            elif pct > 0:
+                change_lbl.configure(text=f"▲ {pct:.0f}% vs last week", text_color="#3ca34d")
+            elif pct < 0:
+                change_lbl.configure(text=f"▼ {abs(pct):.0f}% vs last week", text_color="#e05252")
+            else:
+                change_lbl.configure(text="No change vs last week", text_color="gray")
+
+        for widget in self.dash_insights_container.winfo_children():
             widget.destroy()
 
-        activity = s.get("activity", [])
-        if not activity:
-            ctk.CTkLabel(self.dash_activity_container,
+        insights = comparison.get("insights", [])
+        if not insights:
+            ctk.CTkLabel(self.dash_insights_container,
                          text="No activity yet — run a download, extraction, or profiling "
-                              "job and it'll show up here.",
+                              "job and insights will show up here.",
                          font=ctk.CTkFont(size=12), text_color="gray",
                          wraplength=360, justify="left").pack(anchor="w", pady=10)
             return
 
+        for line in insights:
+            row = ctk.CTkFrame(self.dash_insights_container, fg_color="transparent")
+            row.pack(fill="x", pady=4, anchor="w")
+            ctk.CTkLabel(row, text="•", font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color=STAT_BLUE, width=16).pack(side="left", anchor="n")
+            ctk.CTkLabel(row, text=line, font=ctk.CTkFont(size=12), anchor="w",
+                         justify="left", wraplength=340).pack(side="left", fill="x", expand=True)
+
+    def _show_analytics_placeholder(self):
+        self._show_page("analytics")
+
+    def _build_activity_page(self, parent):
+        page, body = self._new_page(
+            parent, "Activity",
+            "Full history of downloads, extractions, and profiling jobs.")
+
+        list_card = ctk.CTkFrame(body, corner_radius=12, border_width=1,
+                                  border_color=CARD_BORDER, fg_color=CARD_BG)
+        list_card.pack(fill="both", expand=True)
+        ctk.CTkLabel(list_card, text="Recent Activity", font=ctk.CTkFont(weight="bold", size=15)
+                     ).pack(anchor="w", padx=16, pady=(14, 8))
+        self.activity_list_container = ctk.CTkScrollableFrame(list_card, fg_color="transparent")
+        self.activity_list_container.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        return page
+
+    def _refresh_activity_page(self):
+        for widget in self.activity_list_container.winfo_children():
+            widget.destroy()
+
+        s = stats.load_stats()
+        activity = s.get("activity", [])
+        if not activity:
+            ctk.CTkLabel(self.activity_list_container,
+                         text="No activity yet — run a download, extraction, or profiling "
+                              "job and it'll show up here.",
+                         font=ctk.CTkFont(size=12), text_color="gray",
+                         wraplength=500, justify="left").pack(anchor="w", pady=10)
+            return
+
         icon_map = {"downloader": "📥", "pdf": "📄", "profiler": "🧹"}
-        for entry in activity[:6]:
-            row = ctk.CTkFrame(self.dash_activity_container, fg_color="transparent")
+        for entry in activity:
+            row = ctk.CTkFrame(self.activity_list_container, fg_color="transparent")
             row.pack(fill="x", pady=5)
             ctk.CTkLabel(row, text=icon_map.get(entry.get("icon"), "•"), width=28, height=28,
                          corner_radius=8, fg_color=CARD_BORDER, font=ctk.CTkFont(size=13)
@@ -441,9 +504,6 @@ class App(ctk.CTk):
                          text_color="gray", anchor="w").pack(anchor="w")
             ctk.CTkLabel(row, text=stats.format_relative_time(entry.get("timestamp", "")),
                          font=ctk.CTkFont(size=11), text_color="gray").pack(side="right")
-
-    def _show_analytics_placeholder(self):
-        self._show_page("analytics")
 
     def _build_analytics_page(self, parent):
         page, body = self._new_page(
@@ -464,7 +524,7 @@ class App(ctk.CTk):
             ("audio", "🎧", STAT_PURPLE, "Audio", "0"),
         ]
         for i, (key, icon, color, title, value) in enumerate(top_stat_defs):
-            card, value_lbl = self._build_stat_card(stat_row, icon, color, title, value, "")
+            card, value_lbl, _ = self._build_stat_card(stat_row, icon, color, title, value, "")
             card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
             self.analytics_stat_labels[key] = value_lbl
 
@@ -511,7 +571,7 @@ class App(ctk.CTk):
             ("failed", "⚠", STAT_PURPLE, "Failed Downloads", "0"),
         ]
         for i, (key, icon, color, title, value) in enumerate(bottom_defs):
-            card, value_lbl = self._build_stat_card(bottom_row, icon, color, title, value, "")
+            card, value_lbl, _ = self._build_stat_card(bottom_row, icon, color, title, value, "")
             card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
             self.analytics_stat_labels[key] = value_lbl
 
