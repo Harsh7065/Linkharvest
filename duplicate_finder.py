@@ -1,4 +1,4 @@
-"""
+r"""
 Duplicate Finder
 ----------------
 Scans a file, a folder, or a mixed list of files and finds duplicates among:
